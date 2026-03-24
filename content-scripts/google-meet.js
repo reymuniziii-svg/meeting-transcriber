@@ -73,6 +73,13 @@
 
     CaptionParser.startMeeting(PLATFORM, title || document.title);
 
+    // Validate selectors are still working
+    SelectorValidator.validate(PLATFORM, {
+      "Leave/End button": SELECTORS.callEndButton,
+      "Captions container": SELECTORS.captionsContainer,
+      "Captions toggle": SELECTORS.captionsButton,
+    });
+
     // Try to auto-enable captions
     autoEnableCaptions();
 

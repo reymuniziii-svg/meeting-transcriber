@@ -45,6 +45,20 @@ document.addEventListener("DOMContentLoaded", () => {
     );
   });
 
+  // Check for selector warnings
+  chrome.storage.session.get("selectorWarning", (result) => {
+    if (chrome.runtime.lastError || !result.selectorWarning) return;
+
+    const warning = result.selectorWarning;
+    // Only show if recent (within last hour)
+    if (Date.now() - warning.timestamp < 3600000) {
+      const warningEl = document.getElementById("selector-warning");
+      const warningText = document.getElementById("warning-text");
+      warningText.textContent = `${warning.platform}: ${warning.failures} selector(s) may be outdated. Transcription could be incomplete.`;
+      warningEl.classList.remove("hidden");
+    }
+  });
+
   // Manual download button
   btnDownload.addEventListener("click", () => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {

@@ -63,6 +63,14 @@
 
     CaptionParser.startMeeting(PLATFORM, title || document.title);
 
+    // Validate selectors are still working
+    SelectorValidator.validate(PLATFORM, {
+      "Hangup button": SELECTORS.hangupButton,
+      "Captions container": SELECTORS.captionsContainer,
+      "Speaker name": SELECTORS.speakerName,
+      "Caption text": SELECTORS.captionText,
+    });
+
     // Auto-enable captions via keyboard shortcut
     autoEnableCaptions();
 

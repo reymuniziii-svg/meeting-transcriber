@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Review Transcript — Meeting Transcriber</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f0f1a;
+      color: #e0e0e0;
+      line-height: 1.6;
+    }
+
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 40px 24px;
+    }
+
+    h1 {
+      font-size: 24px;
+      margin-bottom: 8px;
+      color: #fff;
+    }
+
+    .subtitle {
+      color: #888;
+      margin-bottom: 32px;
+      font-size: 14px;
+    }
+
+    .meta {
+      background: #1a1a2e;
+      border-radius: 10px;
+      padding: 16px 20px;
+      margin-bottom: 24px;
+      font-size: 14px;
+    }
+
+    .meta-row {
+      display: flex;
+      gap: 24px;
+      flex-wrap: wrap;
+    }
+
+    .meta-item {
+      color: #888;
+    }
+
+    .meta-item strong {
+      color: #ccc;
+    }
+
+    /* Speaker renaming section */
+    .speaker-map {
+      background: #1a1a2e;
+      border-radius: 10px;
+      padding: 20px;
+      margin-bottom: 24px;
+    }
+
+    .speaker-map h2 {
+      font-size: 16px;
+      margin-bottom: 12px;
+      color: #fff;
+    }
+
+    .speaker-map p {
+      font-size: 13px;
+      color: #888;
+      margin-bottom: 16px;
+    }
+
+    .speaker-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+
+    .speaker-label {
+      min-width: 100px;
+      font-size: 14px;
+      color: #aaa;
+    }
+
+    .speaker-arrow {
+      color: #555;
+    }
+
+    .speaker-input {
+      flex: 1;
+      background: #2a2a3e;
+      border: 1px solid #3a3a4e;
+      border-radius: 6px;
+      padding: 8px 12px;
+      color: #fff;
+      font-size: 14px;
+      font-family: inherit;
+    }
+
+    .speaker-input:focus {
+      outline: none;
+      border-color: #4a6cf7;
+    }
+
+    .speaker-input::placeholder {
+      color: #555;
+    }
+
+    .speaker-words {
+      font-size: 12px;
+      color: #666;
+      min-width: 70px;
+      text-align: right;
+    }
+
+    /* Transcript preview */
+    .transcript-section {
+      background: #1a1a2e;
+      border-radius: 10px;
+      padding: 20px;
+      margin-bottom: 24px;
+    }
+
+    .transcript-section h2 {
+      font-size: 16px;
+      margin-bottom: 16px;
+      color: #fff;
+    }
+
+    .segment {
+      margin-bottom: 16px;
+      padding-left: 12px;
+      border-left: 3px solid #2a2a3e;
+    }
+
+    .segment-header {
+      font-size: 14px;
+      margin-bottom: 4px;
+    }
+
+    .segment-speaker {
+      font-weight: 600;
+      color: #4a6cf7;
+    }
+
+    .segment-time {
+      color: #666;
+      font-size: 12px;
+    }
+
+    .segment-text {
+      font-size: 14px;
+      color: #ccc;
+    }
+
+    .segment.low-confidence {
+      border-left-color: #f6ad55;
+    }
+
+    .segment.low-confidence .segment-speaker::after {
+      content: " (uncertain)";
+      color: #f6ad55;
+      font-weight: normal;
+      font-size: 12px;
+    }
+
+    /* Actions */
+    .actions {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 32px;
+    }
+
+    .btn {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .btn-primary {
+      background: #4a6cf7;
+      color: #fff;
+    }
+
+    .btn-primary:hover {
+      background: #3b5de7;
+    }
+
+    .btn-secondary {
+      background: #2a2a3e;
+      color: #ccc;
+    }
+
+    .btn-secondary:hover {
+      background: #3a3a4e;
+    }
+
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .success-msg {
+      color: #48bb78;
+      font-size: 14px;
+      margin-top: 8px;
+      display: none;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: #666;
+    }
+
+    .empty-state h2 {
+      color: #888;
+      margin-bottom: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Review Transcript</h1>
+    <p class="subtitle">Verify speaker names and re-save if needed. The initial transcript has already been saved.</p>
+
+    <div id="content">
+      <div class="empty-state">
+        <h2>No transcript to review</h2>
+        <p>This page shows after a meeting ends. Join a meeting first.</p>
+      </div>
+    </div>
+  </div>
+
+  <script src="review.js"></script>
+</body>
+</html>

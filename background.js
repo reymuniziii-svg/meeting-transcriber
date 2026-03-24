@@ -42,6 +42,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       handleManualDownload(message);
       break;
 
+    case "selectorWarning":
+      handleSelectorWarning(tabId, message);
+      break;
+
     case "captionUpdate":
       // Forward to popup if it's open
       updateBadge(tabId, message.segmentCount);
@@ -73,6 +77,19 @@ function handleMeetingEnded(tabId, message) {
     return;
   }
 
+  // Store transcript for review page
+  const reviewData = {
+    transcript,
+    meetingInfo: {
+      ...meetingInfo,
+      participants: Array.isArray(meetingInfo.participants)
+        ? meetingInfo.participants
+        : Array.from(meetingInfo.participants || []),
+    },
+    savedAt: new Date().toISOString(),
+  };
+  chrome.storage.local.set({ lastTranscript: reviewData });
+
   // Format and save
   const markdown = formatTranscriptAsMarkdown(transcript, meetingInfo);
   const filename = generateFilename(meetingInfo);
@@ -80,8 +97,35 @@ function handleMeetingEnded(tabId, message) {
   saveMarkdownFile(markdown, filename);
   clearBadge(tabId);
 
-  // Clear stored data
+  // Open review page so user can verify speaker names
+  chrome.tabs.create({
+    url: chrome.runtime.getURL("review.html"),
+    active: true,
+  });
+
+  // Clear meeting data (keep lastTranscript for review)
   chrome.storage.local.remove("currentMeeting");
+}
+
+function handleSelectorWarning(tabId, message) {
+  console.warn(
+    `[MeetingTranscriber] Selector warning on ${message.platform}:`,
+    message.details
+  );
+  // Show yellow warning badge
+  if (tabId) {
+    chrome.action.setBadgeText({ text: "!", tabId });
+    chrome.action.setBadgeBackgroundColor({ color: "#f6ad55", tabId });
+  }
+  // Store warning for popup to display
+  chrome.storage.session.set({
+    selectorWarning: {
+      platform: message.platform,
+      failures: message.failures,
+      details: message.details,
+      timestamp: Date.now(),
+    },
+  });
 }
 
 function handleManualDownload(message) {

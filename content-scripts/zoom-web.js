@@ -79,6 +79,13 @@
     const title = document.title.replace("Zoom", "").replace("|", "").trim();
     CaptionParser.startMeeting(PLATFORM, title || "Zoom Meeting");
 
+    // Validate selectors (use zoomDoc which may be inside iframe)
+    SelectorValidator.validate(PLATFORM, {
+      "Audio menu": SELECTORS.audioMenu,
+      "Captions container": SELECTORS.captionsContainer,
+      "Leave button": SELECTORS.leaveButton,
+    }, zoomDoc);
+
     captionDetectionInterval = setInterval(() => detectCaptions(zoomDoc), 1000);
     watchForMeetingEnd(zoomDoc);
   }
