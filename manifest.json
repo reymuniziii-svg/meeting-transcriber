@@ -1,0 +1,55 @@
+{
+  "manifest_version": 3,
+  "name": "Meeting Transcriber",
+  "version": "1.0.0",
+  "description": "Auto-capture meeting transcripts with speaker names from Google Meet, Microsoft Teams, and Zoom web.",
+  "permissions": [
+    "storage",
+    "downloads",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://meet.google.com/*",
+    "https://teams.microsoft.com/*",
+    "https://teams.cloud.microsoft/*",
+    "https://teams.live.com/*",
+    "https://app.zoom.us/*",
+    "https://zoom.us/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://meet.google.com/*"],
+      "js": ["lib/caption-parser.js", "lib/storage.js", "content-scripts/google-meet.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://teams.microsoft.com/*",
+        "https://teams.cloud.microsoft/*",
+        "https://teams.live.com/*"
+      ],
+      "js": ["lib/caption-parser.js", "lib/storage.js", "content-scripts/ms-teams.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://app.zoom.us/*",
+        "https://zoom.us/*"
+      ],
+      "js": ["lib/caption-parser.js", "lib/storage.js", "content-scripts/zoom-web.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Meeting Transcriber"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

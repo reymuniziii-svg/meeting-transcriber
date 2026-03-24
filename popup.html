@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="styles/popup.css">
+</head>
+<body>
+  <div class="container">
+    <h1>Meeting Transcriber</h1>
+
+    <div id="status-section">
+      <div id="status-indicator" class="status idle">
+        <span class="dot"></span>
+        <span id="status-text">No active meeting</span>
+      </div>
+    </div>
+
+    <div id="meeting-info" class="hidden">
+      <div class="info-row">
+        <span class="label">Platform:</span>
+        <span id="info-platform"></span>
+      </div>
+      <div class="info-row">
+        <span class="label">Segments:</span>
+        <span id="info-segments">0</span>
+      </div>
+    </div>
+
+    <div id="controls">
+      <button id="btn-download" class="btn btn-primary hidden" title="Download transcript now">
+        Download Transcript
+      </button>
+    </div>
+
+    <div id="instructions" class="instructions">
+      <p>Join a meeting in Google Meet, Microsoft Teams, or Zoom (web) and enable captions. Transcription starts automatically.</p>
+      <p class="note">Tip: Set Chrome's download folder to <code>~/Desktop/</code> so transcripts save to <code>Desktop/Meeting Transcripts/</code></p>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

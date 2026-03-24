@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+venv/
+.env
+
+# Recordings
+fallback/recordings/
+
+# Chrome extension dev
+*.crx
+*.pem
