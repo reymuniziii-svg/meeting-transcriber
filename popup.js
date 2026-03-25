@@ -1,87 +1,145 @@
 /**
  * Popup UI logic.
- * Shows meeting status and provides manual download control.
  */
 
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
   const statusIndicator = document.getElementById("status-indicator");
   const statusText = document.getElementById("status-text");
   const meetingInfoSection = document.getElementById("meeting-info");
   const infoPlatform = document.getElementById("info-platform");
   const infoSegments = document.getElementById("info-segments");
+  const infoCapture = document.getElementById("info-capture");
+  const serverStatusBox = document.getElementById("server-status");
+  const serverStatusText = document.getElementById("server-status-text");
+  const serverWarning = document.getElementById("server-warning");
+  const serverWarningText = document.getElementById("server-warning-text");
+  const selectorWarning = document.getElementById("selector-warning");
+  const warningText = document.getElementById("warning-text");
+  const btnStartCapture = document.getElementById("btn-start-capture");
   const btnDownload = document.getElementById("btn-download");
-  const instructions = document.getElementById("instructions");
 
-  // Check for active meetings
-  chrome.runtime.sendMessage({ type: "getStatus" }, (response) => {
-    if (chrome.runtime.lastError || !response) return;
+  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const tabId = activeTab?.id;
 
-    const meetings = response.activeMeetings || [];
-    if (meetings.length > 0) {
-      const meeting = meetings[0];
+  const serverConnected = await pingWhisperServer();
+  serverStatusBox.classList.remove("hidden");
+  serverStatusText.textContent = serverConnected ? "Connected" : "Disconnected";
+  serverStatusText.className = serverConnected ? "server-ok" : "server-bad";
+
+  if (!serverConnected) {
+    serverWarning.classList.remove("hidden");
+    serverWarningText.textContent =
+      "Whisper server not running. Start it with ./start-server.sh";
+  }
+
+  if (tabId) {
+    const response = await chrome.runtime.sendMessage({ type: "getStatus", tabId });
+    const meeting = response?.meeting;
+
+    if (meeting) {
       statusIndicator.className = "status recording";
-      statusText.textContent = "Recording...";
-      infoPlatform.textContent = meeting.platform;
+      statusText.textContent = "Meeting detected";
       meetingInfoSection.classList.remove("hidden");
+      infoPlatform.textContent = meeting.platform;
+      infoSegments.textContent = meeting.segmentCount;
+      infoCapture.textContent = formatCaptureStatus(meeting.captureStatus);
       btnDownload.classList.remove("hidden");
-      instructions.classList.add("hidden");
-    }
-  });
 
-  // Get live segment count from active tab
-  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-    if (!tabs[0]) return;
-
-    chrome.tabs.sendMessage(
-      tabs[0].id,
-      { type: "getTranscript" },
-      (response) => {
-        if (chrome.runtime.lastError || !response) return;
-
-        if (response.transcript) {
-          infoSegments.textContent = response.transcript.length;
-        }
+      if (
+        meeting.captureStatus === "awaiting_user_gesture" ||
+        meeting.captureStatus === "idle" ||
+        meeting.captureStatus === "error"
+      ) {
+        btnStartCapture.classList.remove("hidden");
       }
-    );
-  });
 
-  // Check for selector warnings
-  chrome.storage.session.get("selectorWarning", (result) => {
-    if (chrome.runtime.lastError || !result.selectorWarning) return;
-
-    const warning = result.selectorWarning;
-    // Only show if recent (within last hour)
-    if (Date.now() - warning.timestamp < 3600000) {
-      const warningEl = document.getElementById("selector-warning");
-      const warningText = document.getElementById("warning-text");
-      warningText.textContent = `${warning.platform}: ${warning.failures} selector(s) may be outdated. Transcription could be incomplete.`;
-      warningEl.classList.remove("hidden");
+      if (meeting.captureError) {
+        serverWarning.classList.remove("hidden");
+        serverWarningText.textContent = meeting.captureError;
+      }
     }
+  }
+
+  const result = await chrome.storage.session.get("selectorWarning");
+  if (result.selectorWarning && Date.now() - result.selectorWarning.timestamp < 3600000) {
+    selectorWarning.classList.remove("hidden");
+    warningText.textContent = `${result.selectorWarning.platform}: ${result.selectorWarning.failures} selector(s) may be outdated.`;
+  }
+
+  btnStartCapture.addEventListener("click", async () => {
+    if (!tabId) return;
+
+    btnStartCapture.disabled = true;
+    btnStartCapture.textContent = "Connecting...";
+
+    const result = await chrome.runtime.sendMessage({
+      type: "beginCapture",
+      tabId,
+    });
+
+    if (!result?.ok) {
+      serverWarning.classList.remove("hidden");
+      serverWarningText.textContent = result?.error || "Could not connect audio capture.";
+      btnStartCapture.disabled = false;
+      btnStartCapture.textContent = "Connect Audio";
+      return;
+    }
+
+    infoCapture.textContent = "Starting";
+    btnStartCapture.textContent = "Connected";
+    setTimeout(() => {
+      btnStartCapture.classList.add("hidden");
+    }, 1200);
   });
 
-  // Manual download button
-  btnDownload.addEventListener("click", () => {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      if (!tabs[0]) return;
+  btnDownload.addEventListener("click", async () => {
+    if (!tabId) return;
 
-      chrome.tabs.sendMessage(
-        tabs[0].id,
-        { type: "getTranscript" },
-        (response) => {
-          if (chrome.runtime.lastError || !response) return;
-
-          chrome.runtime.sendMessage({
-            type: "downloadTranscript",
-            transcript: response.transcript,
-            meetingInfo: response.meetingInfo,
-          });
-
-          btnDownload.textContent = "Downloaded!";
-          setTimeout(() => {
-            btnDownload.textContent = "Download Transcript";
-          }, 2000);
-        }
-      );
+    const result = await chrome.runtime.sendMessage({
+      type: "downloadCurrentTranscript",
+      tabId,
     });
+
+    btnDownload.textContent = result?.ok ? "Downloaded!" : "No Transcript Yet";
+    setTimeout(() => {
+      btnDownload.textContent = "Download Transcript";
+    }, 2000);
   });
 });
+
+function formatCaptureStatus(status) {
+  switch (status) {
+    case "capturing":
+      return "Connected";
+    case "starting":
+      return "Starting";
+    case "awaiting_user_gesture":
+      return "Needs click";
+    case "error":
+      return "Error";
+    default:
+      return "Idle";
+  }
+}
+
+function pingWhisperServer() {
+  return new Promise((resolve) => {
+    let settled = false;
+    const socket = new WebSocket("ws://127.0.0.1:9090");
+    const timeout = setTimeout(() => finish(false), 1500);
+
+    function finish(result) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      try {
+        socket.close();
+      } catch (error) {}
+      resolve(result);
+    }
+
+    socket.addEventListener("open", () => finish(true));
+    socket.addEventListener("error", () => finish(false));
+    socket.addEventListener("close", () => finish(false));
+  });
+}

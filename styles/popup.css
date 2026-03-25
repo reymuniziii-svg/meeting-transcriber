@@ -105,6 +105,16 @@ h1 {
   background: #3b5de7;
 }
 
+.btn-secondary {
+  margin-top: 10px;
+  background: #2a2a3e;
+  color: #fff;
+}
+
+.btn-secondary:hover {
+  background: #3a3a4e;
+}
+
 .instructions {
   margin-top: 14px;
   font-size: 12px;
@@ -153,6 +163,28 @@ h1 {
   font-weight: 700;
   font-size: 12px;
   flex-shrink: 0;
+}
+
+.server-status {
+  margin-top: 12px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: #2a2a3e;
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+}
+
+.server-status .label {
+  color: #888;
+}
+
+.server-ok {
+  color: #48bb78;
+}
+
+.server-bad {
+  color: #f56565;
 }
 
 .hidden {

@@ -1,56 +1,41 @@
 /**
- * Microsoft Teams (web) caption scraper.
- *
- * DOM structure (as of early 2026):
- * - Captions container: [data-tid="closed-caption-v2-virtual-list-content"]
- *   or [data-tid="closed-captions-renderer"] or [data-tid*="closed-caption"]
- * - Individual caption: .fui-ChatMessageCompact
- * - Speaker name: [data-tid="author"]
- * - Caption text: [data-tid="closed-caption-text"]
- *
- * References: Live-Captions-Saver (Zerg00s)
+ * Microsoft Teams speaker name extraction.
  */
 
 (() => {
   const PLATFORM = "Microsoft Teams";
-  let captionObserver = null;
   let meetingDetectionInterval = null;
-  let captionDetectionInterval = null;
+  let participantPollInterval = null;
+  let activeSpeakerPollInterval = null;
+  let endCheckInterval = null;
   let hasStarted = false;
-  let processedCaptionIds = new Map(); // captionId -> last known text
+  let missingSpeakerPolls = 0;
 
   const SELECTORS = {
-    // Meeting active: hangup button
     hangupButton:
       'button[data-tid="hangup-main-btn"], button[data-tid="hangup-leave-button"], #hangup-button',
-    // Pre-join button
-    prejoinButton: "#prejoin-join-button",
-    // Captions container (multiple fallbacks)
-    captionsContainer: [
-      '[data-tid="closed-caption-v2-virtual-list-content"]',
-      '[data-tid="closed-captions-renderer"]',
-      '[data-tid*="closed-caption"]',
-    ],
-    // Individual caption elements
-    captionItem: ".fui-ChatMessageCompact, [data-tid*='caption-item']",
-    // Speaker name within a caption
-    speakerName: '[data-tid="author"]',
-    // Caption text within a caption
-    captionText: '[data-tid="closed-caption-text"]',
-    // Captions ready indicator
-    captionsReady: '[data-tid="closed-caption-renderer-wrapper"]',
-    // Meeting title
     meetingTitle: '[data-tid="meeting-title"], [data-tid="call-title"]',
+    participantNames: [
+      '[data-tid="display-name"]',
+      '[data-tid="participant-name"]',
+      '[data-tid="author"]',
+      '[aria-label*=" is talking" i]'
+    ],
+    activeSpeaker: [
+      '[aria-label*=" is talking" i]',
+      '[data-tid*="speaking"] [data-tid="display-name"]',
+      '[data-tid*="speaker"] [data-tid="display-name"]',
+      '[data-tid="author"]'
+    ]
   };
 
   function init() {
-    console.log("[MeetingTranscriber] Teams content script loaded.");
     meetingDetectionInterval = setInterval(detectMeeting, 2000);
   }
 
   function detectMeeting() {
-    const hangupBtn = document.querySelector(SELECTORS.hangupButton);
-    if (hangupBtn && !hasStarted) {
+    const hangupButton = document.querySelector(SELECTORS.hangupButton);
+    if (hangupButton && !hasStarted) {
       hasStarted = true;
       clearInterval(meetingDetectionInterval);
       onMeetingJoined();
@@ -59,160 +44,98 @@
 
   function onMeetingJoined() {
     const titleEl = document.querySelector(SELECTORS.meetingTitle);
-    const title = titleEl ? titleEl.textContent.trim() : "";
+    const title = titleEl ? titleEl.textContent.trim() : document.title;
 
-    CaptionParser.startMeeting(PLATFORM, title || document.title);
+    SpeakerTracker.startMeeting(PLATFORM, title);
 
-    // Validate selectors are still working
     SelectorValidator.validate(PLATFORM, {
       "Hangup button": SELECTORS.hangupButton,
-      "Captions container": SELECTORS.captionsContainer,
-      "Speaker name": SELECTORS.speakerName,
-      "Caption text": SELECTORS.captionText,
+      "Participant names": SELECTORS.participantNames,
+      "Active speaker": SELECTORS.activeSpeaker
     });
 
-    // Auto-enable captions via keyboard shortcut
-    autoEnableCaptions();
-
-    // Poll for captions container
-    captionDetectionInterval = setInterval(detectCaptions, 1000);
-
-    watchForMeetingEnd();
-  }
-
-  /**
-   * Enable captions via keyboard shortcut.
-   * macOS: Cmd+Shift+A  |  Windows: Alt+Shift+C
-   */
-  function autoEnableCaptions() {
-    setTimeout(() => {
-      const isMac = navigator.platform.toUpperCase().includes("MAC");
-      const event = new KeyboardEvent("keydown", {
-        key: isMac ? "a" : "c",
-        code: isMac ? "KeyA" : "KeyC",
-        shiftKey: true,
-        metaKey: isMac,
-        altKey: !isMac,
-        bubbles: true,
-      });
-      document.dispatchEvent(event);
-      console.log("[MeetingTranscriber] Sent captions shortcut.");
-    }, 4000);
-  }
-
-  function detectCaptions() {
-    let container = null;
-    for (const selector of SELECTORS.captionsContainer) {
-      container = document.querySelector(selector);
-      if (container) break;
-    }
-
-    if (container) {
-      clearInterval(captionDetectionInterval);
-      startObserving(container);
-    }
-  }
-
-  function startObserving(container) {
-    console.log("[MeetingTranscriber] Observing Teams captions.");
-
-    captionObserver = new MutationObserver(() => {
-      processCaptions(container);
-    });
-
-    captionObserver.observe(container, {
-      childList: true,
-      subtree: true,
-      characterData: true,
-    });
-
-    processCaptions(container);
-  }
-
-  /**
-   * Process all visible caption elements in the container.
-   * Teams creates distinct elements per caption line and updates text in-place.
-   */
-  function processCaptions(container) {
-    const items = container.querySelectorAll(SELECTORS.captionItem);
-
-    items.forEach((item) => {
-      // Generate or retrieve a stable ID for this element
-      let captionId = item.getAttribute("data-mt-caption-id");
-      if (!captionId) {
-        captionId = `cap_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        item.setAttribute("data-mt-caption-id", captionId);
-      }
-
-      const nameEl = item.querySelector(SELECTORS.speakerName);
-      const textEl = item.querySelector(SELECTORS.captionText);
-
-      if (!nameEl || !textEl) {
-        // Fallback: try to extract from innerText
-        processItemFallback(item, captionId);
-        return;
-      }
-
-      const speaker = nameEl.innerText.trim();
-      const text = textEl.innerText.trim();
-
-      if (!speaker || !text) return;
-
-      // Only process if text has changed
-      const lastText = processedCaptionIds.get(captionId);
-      if (lastText === text) return;
-
-      processedCaptionIds.set(captionId, text);
-      CaptionParser.processCaption(speaker, text, captionId);
-    });
-  }
-
-  /**
-   * Fallback for when specific selectors don't match.
-   */
-  function processItemFallback(item, captionId) {
-    const text = item.innerText.trim();
-    if (!text) return;
-
-    const lastText = processedCaptionIds.get(captionId);
-    if (lastText === text) return;
-
-    processedCaptionIds.set(captionId, text);
-
-    // Try to split first line as speaker
-    const lines = text.split("\n").filter((l) => l.trim());
-    if (lines.length >= 2) {
-      CaptionParser.processCaption(lines[0].trim(), lines.slice(1).join(" ").trim(), captionId);
-    } else {
-      CaptionParser.processCaption("Unknown Speaker", text, captionId);
-    }
-  }
-
-  function watchForMeetingEnd() {
-    const endCheck = setInterval(() => {
-      const hangupBtn = document.querySelector(SELECTORS.hangupButton);
-      if (!hangupBtn && hasStarted) {
-        onMeetingEnded();
-        clearInterval(endCheck);
-      }
+    participantPollInterval = setInterval(() => {
+      SpeakerTracker.setParticipants(collectParticipantNames());
     }, 5000);
+
+    activeSpeakerPollInterval = setInterval(() => {
+      const activeSpeaker = detectActiveSpeaker();
+      if (activeSpeaker) {
+        missingSpeakerPolls = 0;
+        SpeakerTracker.setActiveSpeaker(activeSpeaker);
+      } else {
+        missingSpeakerPolls += 1;
+        if (missingSpeakerPolls >= 3) {
+          SpeakerTracker.clearActiveSpeaker();
+        }
+      }
+    }, 1000);
+
+    endCheckInterval = setInterval(() => {
+      if (!document.querySelector(SELECTORS.hangupButton) && hasStarted) {
+        onMeetingEnded();
+      }
+    }, 3000);
+  }
+
+  function collectParticipantNames() {
+    const names = new Set();
+    for (const selector of SELECTORS.participantNames) {
+      document.querySelectorAll(selector).forEach((element) => {
+        const name = extractName(element);
+        if (name) {
+          names.add(name);
+        }
+      });
+    }
+    return [...names];
+  }
+
+  function detectActiveSpeaker() {
+    for (const selector of SELECTORS.activeSpeaker) {
+      const element = document.querySelector(selector);
+      const name = extractName(element);
+      if (name) return name;
+    }
+    return null;
+  }
+
+  function extractName(element) {
+    if (!element) return null;
+
+    const raw =
+      element.getAttribute?.("data-participant-name") ||
+      element.getAttribute?.("aria-label") ||
+      element.textContent;
+
+    if (!raw) return null;
+
+    const cleaned = raw
+      .replace(/\bis talking\b/i, "")
+      .replace(/\bmuted\b/i, "")
+      .replace(/\s+/g, " ")
+      .replace(/:$/, "")
+      .trim();
+
+    if (!cleaned || cleaned.length > 80) return null;
+    if (/hang up|leave|captions|roster/i.test(cleaned)) return null;
+
+    return cleaned;
   }
 
   function onMeetingEnded() {
-    console.log("[MeetingTranscriber] Teams meeting ended.");
-    if (captionObserver) {
-      captionObserver.disconnect();
-      captionObserver = null;
-    }
-    processedCaptionIds.clear();
-    CaptionParser.endMeeting();
+    if (!hasStarted) return;
+
+    clearInterval(participantPollInterval);
+    clearInterval(activeSpeakerPollInterval);
+    clearInterval(endCheckInterval);
+    SpeakerTracker.endMeeting();
     hasStarted = false;
   }
 
-  // Listen for messages from popup
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === "getTranscript") {
-      sendResponse(CaptionParser.getTranscript());
+    if (message.type === "getMeetingSnapshot") {
+      sendResponse(SpeakerTracker.getSnapshot());
       return true;
     }
   });

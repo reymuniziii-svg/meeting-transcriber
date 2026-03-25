@@ -24,6 +24,15 @@
         <span class="label">Segments:</span>
         <span id="info-segments">0</span>
       </div>
+      <div class="info-row">
+        <span class="label">Capture:</span>
+        <span id="info-capture">Idle</span>
+      </div>
+    </div>
+
+    <div id="server-status" class="server-status hidden">
+      <span class="label">Whisper server</span>
+      <span id="server-status-text">Checking...</span>
     </div>
 
     <div id="selector-warning" class="warning hidden">
@@ -31,15 +40,23 @@
       <span id="warning-text">Some selectors may be broken</span>
     </div>
 
+    <div id="server-warning" class="warning hidden">
+      <span class="warning-icon">!</span>
+      <span id="server-warning-text">Whisper server is not running.</span>
+    </div>
+
     <div id="controls">
-      <button id="btn-download" class="btn btn-primary hidden" title="Download transcript now">
+      <button id="btn-start-capture" class="btn btn-primary hidden" title="Connect tab audio to the local Whisper server">
+        Connect Audio
+      </button>
+      <button id="btn-download" class="btn btn-secondary hidden" title="Download transcript now">
         Download Transcript
       </button>
     </div>
 
     <div id="instructions" class="instructions">
-      <p>Join a meeting in Google Meet, Microsoft Teams, or Zoom (web) and enable captions. Transcription starts automatically.</p>
-      <p class="note">Tip: Set Chrome's download folder to <code>~/Desktop/</code> so transcripts save to <code>Desktop/Meeting Transcripts/</code></p>
+      <p>Start the local Whisper server, join a meeting, then click <strong>Connect Audio</strong> once if Chrome asks for a user gesture.</p>
+      <p class="note">Start command: <code>./start-server.sh</code></p>
     </div>
   </div>
 
