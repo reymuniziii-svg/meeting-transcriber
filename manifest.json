@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Meeting Transcriber",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Capture live meeting audio, transcribe with Whisper, and merge real speaker names from meeting UIs.",
   "minimum_chrome_version": "116",
   "permissions": [
