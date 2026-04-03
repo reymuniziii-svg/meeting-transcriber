@@ -1,96 +1,68 @@
 # Meeting Transcriber
 
-Privacy-first Chrome extension that captures meeting tab audio, sends it to a local Whisper server, and merges the transcript with real speaker names scraped from Google Meet, Microsoft Teams, and Zoom web.
+Privacy-first Chrome extension that captures meeting tab audio, streams it to a local Whisper server on `127.0.0.1`, and merges transcript segments with real speaker names detected from Google Meet, Microsoft Teams, and Zoom web.
 
-No cloud transcription. No bots. Everything stays on your machine.
+No cloud transcription. No meeting bot. Audio stays on your machine.
 
-## Quick Start
+## Default Operating Mode
 
-```bash
-git clone https://github.com/reymuniziii-svg/meeting-transcriber.git
-cd meeting-transcriber
-./install.sh
-./start-server.sh
-```
+On macOS, the production path is:
 
-Then:
+1. Run `./install.sh` once.
+2. Load the extension in Chrome.
+3. The local server starts automatically at login through `launchd`.
+4. Open a meeting and click `Connect Audio` if Chrome requires a user gesture for tab audio capture.
 
-1. Open `chrome://extensions/`
-2. Enable Developer mode
-3. Click `Load unpacked`
-4. Select this folder
-5. Join a supported meeting
-6. Open the extension popup and click `Connect Audio` if Chrome requires a user gesture
-
-## How It Works
-
-```text
-Chrome content script
-  -> detects meeting state
-  -> scrapes participant names + active speaker changes
-  -> sends speaker events to background.js
-
-background.js
-  -> requests tabCapture stream ID
-  -> creates offscreen document
-  -> collects speaker timeline + Whisper results
-  -> merges transcript text with real names
-  -> saves markdown + opens review page
-
-offscreen.js
-  -> captures tab audio
-  -> resamples to 16 kHz mono PCM
-  -> streams audio to ws://127.0.0.1:9090
-
-server/transcription-server.py
-  -> buffers audio windows
-  -> runs whisper.cpp
-  -> optionally runs pyannote diarization
-  -> sends timestamped JSON back to the extension
-```
+Manual `./start-server.sh` is now a development fallback, not the primary production workflow.
 
 ## File Structure
 
 ```text
 meeting-transcriber/
-├── manifest.json
 ├── background.js
+├── config/
+│   └── server.env.example
+├── content-scripts/
+│   ├── google-meet.js
+│   ├── ms-teams.js
+│   └── zoom-web.js
+├── docs/
+│   └── selector-maintenance.md
+├── fallback/
+│   ├── requirements.txt
+│   └── transcribe.py
+├── launchd/
+│   └── com.rey.meeting-transcriber.server.plist.template
+├── lib/
+│   ├── markdown-formatter.js
+│   ├── selector-validator.js
+│   ├── speaker-tracker.js
+│   └── storage.js
 ├── offscreen.html
 ├── offscreen.js
 ├── popup.html
 ├── popup.js
 ├── review.html
 ├── review.js
-├── start-server.sh
-├── install.sh
-├── content-scripts/
-│   ├── google-meet.js
-│   ├── ms-teams.js
-│   └── zoom-web.js
-├── lib/
-│   ├── markdown-formatter.js
-│   ├── selector-validator.js
-│   ├── speaker-tracker.js
-│   └── storage.js
 ├── server/
 │   ├── transcription-server.py
-│   └── whisper_utils.py
-├── fallback/
-│   ├── requirements.txt
-│   └── transcribe.py
-└── docs/
-    └── selector-maintenance.md
+│   ├── whisper_utils.py
+│   └── tests/
+│       └── test_whisper_utils.py
+├── install.sh
+├── manifest.json
+└── start-server.sh
 ```
 
 ## Required Installs
 
-Homebrew packages:
+Homebrew:
 
 ```bash
 brew install whisper-cpp
 ```
 
-Python packages:
+Python:
 
 ```bash
 python3 -m venv fallback/.venv
@@ -98,28 +70,50 @@ source fallback/.venv/bin/activate
 pip install -r fallback/requirements.txt
 ```
 
+Chrome:
+
+1. Open `chrome://extensions/`
+2. Enable Developer mode
+3. Click `Load unpacked`
+4. Select this repo folder
+
 ## Environment Variables
 
-Required for pyannote diarization only:
+Repo example file:
+
+`/Users/rey/Desktop/meeting-transcriber/config/server.env.example`
+
+Installed local config:
+
+`~/.config/meeting-transcriber/server.env`
+
+Example:
 
 ```bash
-export HF_TOKEN="hf_your_token_here"
+HF_TOKEN=hf_your_token_here
+MEETING_TRANSCRIBER_HOST=127.0.0.1
+MEETING_TRANSCRIBER_PORT=9090
+MEETING_TRANSCRIBER_LOG_LEVEL=INFO
 ```
 
-If `HF_TOKEN` is missing, Whisper transcription still works. Speaker diarization falls back to DOM speaker events only.
+Notes:
+
+- `HF_TOKEN` is optional. If missing, diarization is disabled cleanly and Whisper transcription still works.
+- `MEETING_TRANSCRIBER_HOST` must stay `127.0.0.1`. `start-server.sh` refuses other bind addresses.
+- LaunchAgents do not reliably inherit shell startup files, so put server config in `~/.config/meeting-transcriber/server.env`, not `.zshrc`.
 
 ## How To Run
 
+Production install on macOS:
+
 ```bash
 ./install.sh
-./start-server.sh
 ```
 
-Optional server flags:
+Development fallback:
 
 ```bash
-./start-server.sh --prompt "Weekly product planning meeting"
-./start-server.sh --vocab "Cadwraethwr,SQLx,Pyannote"
+./start-server.sh
 ```
 
 Health check:
@@ -128,61 +122,105 @@ Health check:
 ./install.sh --check
 ```
 
-## Chrome Permissions And Local Access
+Useful log files:
 
-- `activeTab`: lets the popup initiate capture for the current meeting tab
-- `tabCapture`: reads tab audio only after Chrome grants capture
-- `offscreen`: runs the hidden audio-processing document required by MV3
-- `storage`: saves meeting state for crash recovery and review
-- `downloads`: writes markdown transcripts to your downloads folder
+```text
+~/Library/Logs/MeetingTranscriber/server.log
+~/Library/Logs/MeetingTranscriber/server-error.log
+```
+
+## How It Works
+
+```text
+Chrome content script
+  -> detects meeting state
+  -> scrapes participants + active speaker events
+  -> sends meeting state to background.js
+
+background.js
+  -> persists active meetings by tabId
+  -> retries local server reachability before starting capture
+  -> coordinates offscreen lifecycle, recovery, finalize, and downloads
+
+offscreen.js
+  -> captures tab audio
+  -> resamples to 16 kHz mono PCM
+  -> streams audio to ws://127.0.0.1:9090
+  -> reports terminal states back to the background worker
+
+server/transcription-server.py
+  -> buffers PCM windows
+  -> runs whisper.cpp
+  -> caches Silero VAD once per process
+  -> optionally caches pyannote once per process
+  -> emits transcription and diarization updates over WebSocket
+```
+
+## Permissions, Access, and Auth
+
+Chrome permissions:
+
+- `activeTab`: allows user-initiated capture for the current meeting tab
+- `tabCapture`: reads meeting tab audio after Chrome grants permission
+- `offscreen`: runs the hidden MV3 audio capture document
+- `storage`: persists in-progress meeting state and the last finalized transcript
+- `downloads`: writes markdown transcripts to the browser downloads location
 
 Read/write behavior:
 
 - Reads meeting DOM only on supported meeting URLs
-- Writes transcript files through the Chrome downloads API
-- Writes in-progress state to `chrome.storage.local`
-- Opens a local WebSocket connection to `ws://127.0.0.1:9090`
+- Writes active meeting state to `chrome.storage.local`
+- Writes review payload to `lastTranscript` in `chrome.storage.local`
+- Writes transcript markdown files through the Chrome Downloads API
+- Writes user config to `~/.config/meeting-transcriber/server.env`
+- Writes server logs to `~/Library/Logs/MeetingTranscriber/`
+- Writes a LaunchAgent plist to `~/Library/LaunchAgents/`
 
-Authentication flow:
+Network/auth flow:
 
-- No app login
-- No external API auth for Whisper
-- Optional Hugging Face token for pyannote model download/use
+- No OAuth or external REST auth flow is introduced in this pass
+- The extension talks only to `ws://127.0.0.1:9090`
+- `HF_TOKEN` is only used locally by the Python process if diarization is enabled
 
-Rate limits:
+API scopes and rate limits:
 
-- No cloud API rate limits
-- Throughput is limited by your local CPU/GPU and Whisper model size
+- No cloud transcription API scopes
+- No external API rate limits in the hot path
+- Runtime throughput is bounded by local CPU/GPU, Whisper model size, and diarization cost
+
+## Stability Notes
+
+- Only one live capture session is allowed at a time in this pass.
+- Active meetings are persisted by `tabId` in `currentMeetingsByTabId`.
+- The service worker rehydrates active meetings from storage after restarts.
+- Review-page corrected saves use a deterministic `-corrected` suffix to avoid clobbering the first saved transcript.
+- The Python server keeps at most `2700` seconds of PCM audio in memory by default. That is roughly 86 MB of raw mono 16 kHz 16-bit PCM before Python overhead.
 
 ## Security Considerations
 
-- The Whisper server binds to `127.0.0.1` by default, not the public network
-- The extension talks only to your local server over localhost WebSocket
-- There is no transport auth on the localhost WebSocket, so keep it bound to localhost only
-- Meeting audio and transcripts remain on-device unless you manually move the files elsewhere
-- `HF_TOKEN` should be stored in your shell profile, not hard-coded in repo files
+- The localhost WebSocket is intentionally unauthenticated, so it must remain bound to `127.0.0.1` only.
+- Launchd config is per-user, not system-wide.
+- Meeting content stays local unless you manually move exported files elsewhere.
+- `HF_TOKEN` should live in `~/.config/meeting-transcriber/server.env`, not inside repo files.
+- Review rendering now uses DOM node creation and `textContent` instead of raw `innerHTML`, which prevents participant-name markup injection from rendering as HTML.
 
-## Output
+## Verification
 
-Markdown transcripts are saved to Chrome’s configured downloads location using filenames like:
+Quick checks:
 
-```text
-Meeting Transcripts/2026-03-24_14-30_google-meet_weekly-planning.md
+```bash
+./install.sh --check
+python3 -m unittest discover -s server/tests
 ```
 
-## Verification Checklist
+Manual acceptance targets for this pass:
 
-1. `./start-server.sh` starts and listens on port `9090`
-2. The popup shows `Whisper server: Connected`
-3. Joining a meeting changes the popup state to `Meeting detected`
-4. Clicking `Connect Audio` changes capture status to `Connected`
-5. Segment count increases during speech
-6. Ending the meeting saves a markdown transcript and opens the review page
-
-## Notes
-
-- Google Meet, Teams, and Zoom DOM selectors can drift over time. See `docs/selector-maintenance.md`.
-- The extension currently supports one live audio capture session at a time.
+1. Install on macOS, log out/in, and confirm the server is listening on `127.0.0.1:9090` without manually running `./start-server.sh`.
+2. Kill the Python server process and confirm `launchd` restarts it.
+3. Start capture with the server available and confirm the popup shows `Meeting detected` and a stable capture state.
+4. Start capture with the server temporarily down and confirm the popup waits briefly, then shows a clear failure.
+5. End a meeting or close the tab abruptly and confirm the final transcript includes the last spoken segment.
+6. Save a corrected transcript and confirm success appears only after the download request succeeds.
 
 ## License
 

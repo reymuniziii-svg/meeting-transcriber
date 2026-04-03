@@ -11,14 +11,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         await startCapture(message);
         sendResponse({ ok: true });
         return;
-
       case "stopCapture":
         await stopCapture(message);
         sendResponse({ ok: true });
         return;
+      default:
+        return;
     }
-
-    sendResponse({ ok: false, error: "Unsupported offscreen message type." });
   })().catch((error) => {
     console.error("[MeetingTranscriber] Offscreen error:", error);
     reportToBackground("offscreenError", {
@@ -32,7 +31,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 async function startCapture(config) {
-  await cleanupCapture();
+  await cleanupCapture({ reason: "replaced", suppressTerminalEvent: true });
 
   const mediaStream = await navigator.mediaDevices.getUserMedia({
     audio: {
@@ -61,7 +60,8 @@ async function startCapture(config) {
     processor,
     mutedGain,
     socket,
-    stopped: false,
+    stopRequested: false,
+    terminalReported: false,
   };
 
   processor.onaudioprocess = (event) => {
@@ -69,8 +69,7 @@ async function startCapture(config) {
       return;
     }
 
-    const input = event.inputBuffer;
-    const pcm = floatTo16BitPCM(input);
+    const pcm = floatTo16BitPCM(event.inputBuffer);
     captureState.socket.send(pcm.buffer);
   };
 
@@ -102,7 +101,7 @@ async function startCapture(config) {
     });
   });
 
-  socket.addEventListener("message", (event) => {
+  socket.addEventListener("message", async (event) => {
     let payload;
     try {
       payload = JSON.parse(event.data);
@@ -118,7 +117,6 @@ async function startCapture(config) {
           segments: payload.segments || [],
         });
         break;
-
       case "diarization":
         reportToBackground("offscreenDiarization", {
           tabId: config.tabId,
@@ -126,43 +124,61 @@ async function startCapture(config) {
           speakers: payload.speakers || [],
         });
         break;
-
       case "sessionStopped":
-        cleanupCapture().then(() => {
-          reportToBackground("offscreenCaptureStopped", {
-            tabId: config.tabId,
-            sessionId: config.sessionId,
-          });
+        await cleanupCapture({
+          reason: "sessionStopped",
+          reportStopped: true,
+          reportTerminal: true,
+          terminalServerStatus: "disconnected",
         });
         break;
-
       case "error":
         reportToBackground("offscreenError", {
           tabId: config.tabId,
           error: payload.error || "Unknown transcription server error.",
         });
         break;
+      default:
+        break;
     }
   });
 
-  socket.addEventListener("error", () => {
+  socket.addEventListener("error", async () => {
     reportToBackground("offscreenServerStatus", {
       tabId: config.tabId,
       status: "disconnected",
     });
-    cleanupCapture();
+    await cleanupCapture({
+      reason: "socketError",
+      reportStopped: captureState?.stopRequested,
+      reportTerminal: true,
+      terminalError: captureState?.stopRequested
+        ? null
+        : "The local server connection failed during audio capture.",
+      terminalServerStatus: "disconnected",
+    });
   });
 
-  socket.addEventListener("close", () => {
-    if (!captureState || captureState.stopped) {
+  socket.addEventListener("close", async () => {
+    const state = captureState;
+    if (!state) {
       return;
     }
 
     reportToBackground("offscreenServerStatus", {
-      tabId: config.tabId,
+      tabId: state.tabId,
       status: "disconnected",
     });
-    cleanupCapture();
+
+    await cleanupCapture({
+      reason: state.stopRequested ? "closedAfterStop" : "unexpectedClose",
+      reportStopped: state.stopRequested,
+      reportTerminal: true,
+      terminalError: state.stopRequested
+        ? null
+        : "The local server closed the capture connection unexpectedly.",
+      terminalServerStatus: "disconnected",
+    });
   });
 }
 
@@ -172,10 +188,16 @@ async function stopCapture(config) {
       tabId: config.tabId,
       sessionId: config.sessionId,
     });
+    reportToBackground("offscreenCaptureTerminal", {
+      tabId: config.tabId,
+      sessionId: config.sessionId,
+      reason: "alreadyStopped",
+      serverStatus: "disconnected",
+    });
     return;
   }
 
-  captureState.stopped = true;
+  captureState.stopRequested = true;
 
   if (captureState.socket.readyState === WebSocket.OPEN) {
     captureState.socket.send(
@@ -184,58 +206,96 @@ async function stopCapture(config) {
         sessionId: captureState.sessionId,
       })
     );
+
     setTimeout(async () => {
-      if (captureState) {
-        await cleanupCapture();
-        reportToBackground("offscreenCaptureStopped", {
-          tabId: config.tabId,
-          sessionId: config.sessionId,
-        });
+      if (!captureState) {
+        return;
       }
-    }, 500);
+
+      await cleanupCapture({
+        reason: "stopTimeout",
+        reportStopped: true,
+        reportTerminal: true,
+        terminalServerStatus: "disconnected",
+      });
+    }, 800);
     return;
   }
 
-  await cleanupCapture();
-  reportToBackground("offscreenCaptureStopped", {
-    tabId: config.tabId,
-    sessionId: config.sessionId,
+  await cleanupCapture({
+    reason: "stopWithoutOpenSocket",
+    reportStopped: true,
+    reportTerminal: true,
+    terminalServerStatus: "disconnected",
   });
 }
 
-async function cleanupCapture() {
-  if (!captureState) return;
+async function cleanupCapture(options = {}) {
+  if (!captureState) {
+    return;
+  }
+
+  const state = captureState;
+  captureState = null;
 
   try {
-    captureState.processor.disconnect();
-  } catch (error) {}
+    state.processor.disconnect();
+  } catch (error) {
+    // Ignore.
+  }
 
   try {
-    captureState.source.disconnect();
-  } catch (error) {}
+    state.source.disconnect();
+  } catch (error) {
+    // Ignore.
+  }
 
   try {
-    captureState.mutedGain.disconnect();
-  } catch (error) {}
+    state.mutedGain.disconnect();
+  } catch (error) {
+    // Ignore.
+  }
 
   try {
-    captureState.mediaStream.getTracks().forEach((track) => track.stop());
-  } catch (error) {}
+    state.mediaStream.getTracks().forEach((track) => track.stop());
+  } catch (error) {
+    // Ignore.
+  }
 
   try {
-    await captureState.audioContext.close();
-  } catch (error) {}
+    await state.audioContext.close();
+  } catch (error) {
+    // Ignore.
+  }
 
   try {
     if (
-      captureState.socket.readyState === WebSocket.OPEN ||
-      captureState.socket.readyState === WebSocket.CONNECTING
+      state.socket.readyState === WebSocket.OPEN ||
+      state.socket.readyState === WebSocket.CONNECTING
     ) {
-      captureState.socket.close();
+      state.socket.close();
     }
-  } catch (error) {}
+  } catch (error) {
+    // Ignore.
+  }
 
-  captureState = null;
+  if (options.reportStopped) {
+    reportToBackground("offscreenCaptureStopped", {
+      tabId: state.tabId,
+      sessionId: state.sessionId,
+    });
+  }
+
+  if (options.reportTerminal && !options.suppressTerminalEvent && !state.terminalReported) {
+    state.terminalReported = true;
+    reportToBackground("offscreenCaptureTerminal", {
+      tabId: state.tabId,
+      sessionId: state.sessionId,
+      reason: options.reason || "cleanup",
+      error: options.terminalError || null,
+      serverStatus: options.terminalServerStatus || "disconnected",
+    });
+  }
 }
 
 function floatTo16BitPCM(audioBuffer) {

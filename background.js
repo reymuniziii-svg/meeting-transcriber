@@ -1,97 +1,107 @@
 /**
  * Background service worker.
- * Coordinates live audio capture, Whisper results, speaker timelines, and downloads.
+ * Coordinates live audio capture, recovery, transcript merging, and downloads.
  */
 
 importScripts("lib/markdown-formatter.js");
 
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 const OFFSCREEN_DOCUMENT_URL = chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH);
+const SERVER_WS_URL = "ws://127.0.0.1:9090";
+const STORAGE_KEY = "currentMeetingsByTabId";
+const LAST_TRANSCRIPT_KEY = "lastTranscript";
+const SERVER_RETRY_WINDOW_MS = 8000;
+const SERVER_RETRY_INTERVAL_MS = 1000;
+const FINALIZE_TIMEOUT_MS = 2000;
+
 const activeMeetings = new Map();
+
+chrome.runtime.onInstalled.addListener(() => {
+  rehydrateMeetings().catch((error) => {
+    console.error("[MeetingTranscriber] Rehydrate failed on install:", error);
+  });
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  rehydrateMeetings().catch((error) => {
+    console.error("[MeetingTranscriber] Rehydrate failed on startup:", error);
+  });
+});
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const tabId = sender.tab?.id ?? message.tabId;
 
   (async () => {
+    await ensureMeetingsLoaded();
+
     switch (message.type) {
       case "meetingStarted":
         await handleMeetingStarted(tabId, message);
         sendResponse({ ok: true });
         return;
-
       case "meetingEnded":
         await handleMeetingEnded(tabId, message);
         sendResponse({ ok: true });
         return;
-
       case "participants":
         await handleParticipants(tabId, message.names || []);
         sendResponse({ ok: true });
         return;
-
       case "activeSpeaker":
         await handleActiveSpeaker(tabId, message);
         sendResponse({ ok: true });
         return;
-
       case "activeSpeakerCleared":
         await handleActiveSpeakerCleared(tabId, message.timestamp);
         sendResponse({ ok: true });
         return;
-
       case "selectorWarning":
         await handleSelectorWarning(tabId, message);
         sendResponse({ ok: true });
         return;
-
       case "getStatus":
         sendResponse(await getStatus(tabId));
         return;
-
       case "beginCapture":
         sendResponse(await startCaptureForMeeting(message.tabId, true));
         return;
-
       case "downloadCurrentTranscript":
         sendResponse(await handleManualDownload(message.tabId));
         return;
-
       case "downloadTranscript":
         sendResponse(await handleDirectDownload(message.transcript, message.meetingInfo));
         return;
-
       case "offscreenCaptureStarted":
         await handleOffscreenCaptureStarted(message);
         sendResponse({ ok: true });
         return;
-
       case "offscreenCaptureStopped":
         await handleOffscreenCaptureStopped(message);
         sendResponse({ ok: true });
         return;
-
+      case "offscreenCaptureTerminal":
+        await handleOffscreenCaptureTerminal(message);
+        sendResponse({ ok: true });
+        return;
       case "offscreenServerStatus":
         await handleOffscreenServerStatus(message);
         sendResponse({ ok: true });
         return;
-
       case "offscreenTranscription":
         await handleOffscreenTranscription(message);
         sendResponse({ ok: true });
         return;
-
       case "offscreenDiarization":
         await handleOffscreenDiarization(message);
         sendResponse({ ok: true });
         return;
-
       case "offscreenError":
         await handleOffscreenError(message);
         sendResponse({ ok: true });
         return;
+      default:
+        sendResponse({ ok: false, error: `Unsupported message type: ${message.type}` });
     }
-
-    sendResponse({ ok: false, error: `Unsupported message type: ${message.type}` });
   })().catch((error) => {
     console.error("[MeetingTranscriber] Background error:", error);
     sendResponse({ ok: false, error: error.message || String(error) });
@@ -100,8 +110,48 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
+chrome.tabs.onRemoved.addListener((tabId) => {
+  handleTabClosed(tabId).catch((error) => {
+    console.error("[MeetingTranscriber] Tab close handling failed:", error);
+  });
+});
+
+async function ensureMeetingsLoaded() {
+  if (activeMeetings.size > 0) {
+    return;
+  }
+  await rehydrateMeetings();
+}
+
+async function rehydrateMeetings() {
+  const stored = await chrome.storage.local.get(STORAGE_KEY);
+  const meetingsByTabId = stored[STORAGE_KEY] || {};
+
+  for (const [tabIdKey, data] of Object.entries(meetingsByTabId)) {
+    const tabId = Number(tabIdKey);
+    if (!Number.isInteger(tabId)) {
+      continue;
+    }
+
+    activeMeetings.set(tabId, {
+      ...createMeetingState(tabId),
+      ...data,
+      tabId,
+      sessionId: data.sessionId || `tab-${tabId}`,
+      participants: [...(data.participants || [])],
+      speakerEvents: [...(data.speakerEvents || [])],
+      transcriptionSegments: [...(data.transcriptionSegments || [])],
+      diarizationSegments: [...(data.diarizationSegments || [])],
+      pendingFinalization: Boolean(data.pendingFinalization),
+      finalizationTimerActive: false,
+    });
+  }
+}
+
 async function handleMeetingStarted(tabId, message) {
-  if (!tabId) return;
+  if (!tabId) {
+    return;
+  }
 
   const existing = activeMeetings.get(tabId) || createMeetingState(tabId, message);
   existing.platform = message.platform || existing.platform;
@@ -111,6 +161,7 @@ async function handleMeetingStarted(tabId, message) {
   existing.endTime = null;
   existing.endEpochMs = null;
   existing.pendingFinalization = false;
+  existing.captureError = null;
   activeMeetings.set(tabId, existing);
 
   updateBadge(tabId, existing.transcriptionSegments.length);
@@ -118,13 +169,15 @@ async function handleMeetingStarted(tabId, message) {
 
   const startResult = await startCaptureForMeeting(tabId, false);
   if (!startResult.ok && startResult.error) {
-    console.warn("[MeetingTranscriber] Capture not started yet:", startResult.error);
+    console.warn("[MeetingTranscriber] Capture not auto-started:", startResult.error);
   }
 }
 
 async function handleMeetingEnded(tabId, message) {
   const meeting = getMeeting(tabId);
-  if (!meeting) return;
+  if (!meeting) {
+    return;
+  }
 
   meeting.endTime = message.meetingInfo?.endTime || new Date().toISOString();
   meeting.endEpochMs = new Date(meeting.endTime).getTime();
@@ -132,19 +185,24 @@ async function handleMeetingEnded(tabId, message) {
 
   if (Array.isArray(message.speakerTimeline) && message.speakerTimeline.length > 0) {
     for (const segment of message.speakerTimeline) {
-      meeting.completedSpeakerTimeline.push(segment);
+      meeting.speakerEvents.push({
+        name: segment.name,
+        timestamp: segment.start,
+      });
+      meeting.speakerEvents.push({
+        name: null,
+        timestamp: segment.end,
+      });
     }
   }
 
   await persistMeetingState(meeting);
 
-  if (meeting.captureStatus === "capturing" || meeting.captureStatus === "starting") {
+  if (isCaptureLive(meeting.captureStatus)) {
+    meeting.captureStatus = "stopping";
+    await persistMeetingState(meeting);
     await stopCaptureForMeeting(meeting);
-    setTimeout(() => {
-      finalizeMeetingIfReady(tabId).catch((error) => {
-        console.error("[MeetingTranscriber] Deferred finalize failed:", error);
-      });
-    }, 1500);
+    scheduleFinalizeFallback(meeting.tabId);
     return;
   }
 
@@ -153,7 +211,9 @@ async function handleMeetingEnded(tabId, message) {
 
 async function handleParticipants(tabId, names) {
   const meeting = getMeeting(tabId);
-  if (!meeting) return;
+  if (!meeting) {
+    return;
+  }
 
   meeting.participants = mergeUniqueNames(meeting.participants, names);
   await persistMeetingState(meeting);
@@ -161,7 +221,9 @@ async function handleParticipants(tabId, names) {
 
 async function handleActiveSpeaker(tabId, message) {
   const meeting = getMeeting(tabId);
-  if (!meeting || !message.name || !message.timestamp) return;
+  if (!meeting || !message.name || !message.timestamp) {
+    return;
+  }
 
   const lastEvent = meeting.speakerEvents[meeting.speakerEvents.length - 1];
   if (lastEvent && lastEvent.name === message.name) {
@@ -172,14 +234,15 @@ async function handleActiveSpeaker(tabId, message) {
     name: message.name,
     timestamp: message.timestamp,
   });
-
   meeting.participants = mergeUniqueNames(meeting.participants, [message.name]);
   await persistMeetingState(meeting);
 }
 
 async function handleActiveSpeakerCleared(tabId, timestamp) {
   const meeting = getMeeting(tabId);
-  if (!meeting || !timestamp) return;
+  if (!meeting || !timestamp) {
+    return;
+  }
 
   const lastEvent = meeting.speakerEvents[meeting.speakerEvents.length - 1];
   if (lastEvent && lastEvent.name === null) {
@@ -190,7 +253,6 @@ async function handleActiveSpeakerCleared(tabId, timestamp) {
     name: null,
     timestamp,
   });
-
   await persistMeetingState(meeting);
 }
 
@@ -211,13 +273,10 @@ async function handleSelectorWarning(tabId, message) {
 }
 
 async function getStatus(tabId) {
+  await ensureMeetingsLoaded();
   const meeting = tabId ? activeMeetings.get(tabId) : activeMeetings.values().next().value;
-  if (!meeting) {
-    return { meeting: null, activeMeetings: [] };
-  }
-
   return {
-    meeting: summarizeMeeting(meeting),
+    meeting: meeting ? summarizeMeeting(meeting) : null,
     activeMeetings: [...activeMeetings.values()].map(summarizeMeeting),
   };
 }
@@ -228,39 +287,47 @@ async function startCaptureForMeeting(tabId, userInitiated) {
     return { ok: false, error: "No active meeting found for this tab." };
   }
 
-  if (meeting.captureStatus === "capturing" || meeting.captureStatus === "starting") {
+  if (["capturing", "starting", "waiting_for_server", "stopping"].includes(meeting.captureStatus)) {
     return { ok: true, status: meeting.captureStatus };
   }
 
   const otherMeeting = [...activeMeetings.values()].find(
-    (candidate) =>
-      candidate.tabId !== tabId &&
-      (candidate.captureStatus === "capturing" || candidate.captureStatus === "starting")
+    (candidate) => candidate.tabId !== tabId && isCaptureLive(candidate.captureStatus)
   );
   if (otherMeeting) {
-    return {
-      ok: false,
-      error: "Only one live audio capture session is supported at a time.",
-    };
+    return { ok: false, error: "Only one live audio capture session is supported at a time." };
+  }
+
+  meeting.captureStatus = "waiting_for_server";
+  meeting.serverStatus = "retrying";
+  meeting.captureError = null;
+  await persistMeetingState(meeting);
+
+  const reachable = await waitForServerReachability();
+  if (!reachable) {
+    meeting.captureStatus = "error";
+    meeting.serverStatus = "unavailable";
+    meeting.captureError =
+      "Waiting for local server timed out. Check launchd logs or run ./start-server.sh for development.";
+    await persistMeetingState(meeting);
+    return { ok: false, error: meeting.captureError };
   }
 
   try {
     await ensureOffscreenDocument();
 
     meeting.captureStatus = "starting";
+    meeting.serverStatus = "connected";
     meeting.captureError = null;
     await persistMeetingState(meeting);
 
-    const streamId = await chrome.tabCapture.getMediaStreamId({
-      targetTabId: tabId,
-    });
-
+    const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
     await chrome.runtime.sendMessage({
       type: "startCapture",
       tabId,
-      sessionId: `tab-${tabId}`,
+      sessionId: meeting.sessionId,
       streamId,
-      wsUrl: "ws://127.0.0.1:9090",
+      wsUrl: SERVER_WS_URL,
       title: meeting.title,
       platform: meeting.platform,
       prompt: "",
@@ -272,15 +339,14 @@ async function startCaptureForMeeting(tabId, userInitiated) {
     const message = error?.message || String(error);
     const lowered = message.toLowerCase();
 
-    if (!userInitiated && lowered.includes("user gesture")) {
+    if (lowered.includes("user gesture")) {
       meeting.captureStatus = "awaiting_user_gesture";
-      meeting.captureError = "Open the extension popup and click Connect Audio.";
-    } else if (lowered.includes("user gesture")) {
-      meeting.captureStatus = "awaiting_user_gesture";
-      meeting.captureError = message;
+      meeting.captureError = userInitiated
+        ? "Audio capture permission needed. Chrome requires a direct click to connect tab audio."
+        : "Audio capture permission needed. Open the extension popup and click Connect Audio.";
     } else {
       meeting.captureStatus = "error";
-      meeting.captureError = message;
+      meeting.captureError = message || "Capture failed.";
     }
 
     await persistMeetingState(meeting);
@@ -312,8 +378,10 @@ async function handleManualDownload(tabId) {
   }
 
   const meetingInfo = buildMeetingInfo(meeting, transcript);
-  const markdown = formatTranscriptAsMarkdown(transcript, meetingInfo);
-  saveMarkdownFile(markdown, generateFilename(meetingInfo));
+  saveMarkdownFile(
+    formatTranscriptAsMarkdown(transcript, meetingInfo),
+    generateOutputFilename(meetingInfo)
+  );
   return { ok: true };
 }
 
@@ -323,16 +391,19 @@ async function handleDirectDownload(transcript, meetingInfo) {
   }
 
   const markdown = formatTranscriptAsMarkdown(transcript, meetingInfo);
-  saveMarkdownFile(markdown, generateFilename(meetingInfo));
+  saveMarkdownFile(markdown, generateOutputFilename(meetingInfo));
   return { ok: true };
 }
 
 async function handleOffscreenCaptureStarted(message) {
   const meeting = getMeeting(message.tabId);
-  if (!meeting) return;
+  if (!meeting) {
+    return;
+  }
 
   meeting.captureStatus = "capturing";
   meeting.serverStatus = "connected";
+  meeting.captureError = null;
   meeting.audioStartEpochMs = message.startedAt || Date.now();
   meeting.sessionId = message.sessionId || meeting.sessionId;
   await persistMeetingState(meeting);
@@ -340,7 +411,9 @@ async function handleOffscreenCaptureStarted(message) {
 
 async function handleOffscreenCaptureStopped(message) {
   const meeting = getMeeting(message.tabId);
-  if (!meeting) return;
+  if (!meeting) {
+    return;
+  }
 
   meeting.captureStatus = "stopped";
   await persistMeetingState(meeting);
@@ -352,24 +425,52 @@ async function handleOffscreenCaptureStopped(message) {
   await closeOffscreenDocumentIfIdle();
 }
 
+async function handleOffscreenCaptureTerminal(message) {
+  const meeting = getMeeting(message.tabId);
+  if (!meeting) {
+    return;
+  }
+
+  meeting.serverStatus = message.serverStatus || "disconnected";
+  if (message.error && !meeting.captureError) {
+    meeting.captureError = message.error;
+  }
+  if (meeting.captureStatus !== "stopped") {
+    meeting.captureStatus = meeting.pendingFinalization ? "stopped" : "error";
+  }
+  await persistMeetingState(meeting);
+
+  if (meeting.pendingFinalization) {
+    await finalizeMeetingIfReady(meeting.tabId);
+  }
+}
+
 async function handleOffscreenServerStatus(message) {
   const meeting = getMeeting(message.tabId);
-  if (!meeting) return;
+  if (!meeting) {
+    return;
+  }
 
   meeting.serverStatus = message.status || "unknown";
-  if (message.status === "disconnected" && meeting.captureStatus === "starting") {
-    meeting.captureStatus = "error";
-    meeting.captureError = "Whisper server is not running on ws://127.0.0.1:9090.";
+  if (message.status === "disconnected" && isCaptureLive(meeting.captureStatus)) {
+    meeting.captureStatus = meeting.pendingFinalization ? "stopped" : "error";
+    meeting.captureError = meeting.pendingFinalization
+      ? meeting.captureError
+      : "Capture failed because the local server disconnected unexpectedly.";
   }
   await persistMeetingState(meeting);
 }
 
 async function handleOffscreenTranscription(message) {
   const meeting = getMeeting(message.tabId);
-  if (!meeting || !Array.isArray(message.segments)) return;
+  if (!meeting || !Array.isArray(message.segments)) {
+    return;
+  }
 
   for (const segment of message.segments) {
-    if (!segment.text) continue;
+    if (!segment.text) {
+      continue;
+    }
     meeting.transcriptionSegments.push({
       start: Number(segment.start),
       end: Number(segment.end),
@@ -378,48 +479,61 @@ async function handleOffscreenTranscription(message) {
   }
 
   meeting.transcriptionSegments.sort((a, b) => a.start - b.start);
+  meeting.transcriptionSegments = dedupeTranscriptSegments(meeting.transcriptionSegments);
   updateBadge(meeting.tabId, meeting.transcriptionSegments.length);
   await persistMeetingState(meeting);
 }
 
 async function handleOffscreenDiarization(message) {
   const meeting = getMeeting(message.tabId);
-  if (!meeting || !Array.isArray(message.speakers)) return;
+  if (!meeting || !Array.isArray(message.speakers)) {
+    return;
+  }
 
-  meeting.diarizationSegments = message.speakers
-    .map((speaker) => ({
+  const combined = meeting.diarizationSegments.concat(
+    message.speakers.map((speaker) => ({
       start: Number(speaker.start),
       end: Number(speaker.end),
       speaker_id: speaker.speaker_id,
       label: speaker.label || speaker.speaker_id,
     }))
-    .sort((a, b) => a.start - b.start);
+  );
 
+  meeting.diarizationSegments = dedupeDiarizationSegments(combined);
   await persistMeetingState(meeting);
 }
 
 async function handleOffscreenError(message) {
   const meeting = getMeeting(message.tabId);
-  if (!meeting) return;
+  if (!meeting) {
+    return;
+  }
 
-  meeting.captureStatus = "error";
+  meeting.captureStatus = meeting.pendingFinalization ? "stopped" : "error";
   meeting.serverStatus = "disconnected";
   meeting.captureError = message.error || "Unknown offscreen capture error.";
   await persistMeetingState(meeting);
+
+  if (meeting.pendingFinalization) {
+    await finalizeMeetingIfReady(meeting.tabId);
+  }
 }
 
 async function finalizeMeetingIfReady(tabId) {
   const meeting = getMeeting(tabId);
-  if (!meeting) return;
+  if (!meeting) {
+    await removePersistedMeeting(tabId);
+    return;
+  }
 
   const transcript = buildMergedTranscript(meeting);
   const meetingInfo = buildMeetingInfo(meeting, transcript);
 
   activeMeetings.delete(tabId);
   clearBadge(tabId);
+  await removePersistedMeeting(tabId);
 
   if (transcript.length === 0) {
-    await chrome.storage.local.remove("currentMeeting");
     return;
   }
 
@@ -428,12 +542,12 @@ async function finalizeMeetingIfReady(tabId) {
     meetingInfo,
     savedAt: new Date().toISOString(),
   };
-  await chrome.storage.local.set({ lastTranscript: reviewData });
+  await chrome.storage.local.set({ [LAST_TRANSCRIPT_KEY]: reviewData });
 
-  const markdown = formatTranscriptAsMarkdown(transcript, meetingInfo);
-  saveMarkdownFile(markdown, generateFilename(meetingInfo));
-
-  await chrome.storage.local.remove("currentMeeting");
+  saveMarkdownFile(
+    formatTranscriptAsMarkdown(transcript, meetingInfo),
+    generateOutputFilename(meetingInfo)
+  );
 
   chrome.tabs.create({
     url: chrome.runtime.getURL("review.html"),
@@ -441,19 +555,37 @@ async function finalizeMeetingIfReady(tabId) {
   });
 }
 
+async function handleTabClosed(tabId) {
+  await ensureMeetingsLoaded();
+  const meeting = getMeeting(tabId);
+  if (!meeting) {
+    await removePersistedMeeting(tabId);
+    return;
+  }
+
+  meeting.endTime = new Date().toISOString();
+  meeting.endEpochMs = Date.now();
+  meeting.pendingFinalization = true;
+
+  if (isCaptureLive(meeting.captureStatus)) {
+    meeting.captureStatus = "stopping";
+    await persistMeetingState(meeting);
+    await stopCaptureForMeeting(meeting);
+    scheduleFinalizeFallback(tabId);
+    return;
+  }
+
+  await persistMeetingState(meeting);
+  await finalizeMeetingIfReady(tabId);
+}
+
 function buildMergedTranscript(meeting) {
   if (!meeting.audioStartEpochMs || meeting.transcriptionSegments.length === 0) {
     return [];
   }
 
-  const domTimeline = buildDomTimeline(
-    meeting,
-    meeting.endEpochMs || Date.now()
-  );
-  const speakerMap = matchSpeakerIdsToRealNames(
-    meeting.diarizationSegments,
-    domTimeline
-  );
+  const domTimeline = buildDomTimeline(meeting, meeting.endEpochMs || Date.now());
+  const speakerMap = matchSpeakerIdsToRealNames(meeting.diarizationSegments, domTimeline);
 
   const transcript = [];
   for (const segment of meeting.transcriptionSegments) {
@@ -477,9 +609,7 @@ function buildMergedTranscript(meeting) {
     transcript.push({
       speaker: speaker || "Unknown Speaker",
       text: segment.text,
-      timestamp: new Date(
-        meeting.audioStartEpochMs + segment.start * 1000
-      ).toISOString(),
+      timestamp: new Date(meeting.audioStartEpochMs + segment.start * 1000).toISOString(),
       start: segment.start,
       end: segment.end,
       confidence: Number(confidence.toFixed(2)),
@@ -491,10 +621,7 @@ function buildMergedTranscript(meeting) {
 
 function buildDomTimeline(meeting, endEpochMs) {
   const rawEvents = [...meeting.speakerEvents]
-    .map((event) => ({
-      name: event.name,
-      timestamp: Number(event.timestamp),
-    }))
+    .map((event) => ({ name: event.name, timestamp: Number(event.timestamp) }))
     .filter((event) => Number.isFinite(event.timestamp))
     .sort((a, b) => a.timestamp - b.timestamp);
 
@@ -507,16 +634,9 @@ function buildDomTimeline(meeting, endEpochMs) {
     }
 
     if (previous && previous.name) {
-      const start = Math.max(
-        0,
-        (previous.timestamp - meeting.audioStartEpochMs) / 1000
-      );
+      const start = Math.max(0, (previous.timestamp - meeting.audioStartEpochMs) / 1000);
       const end = Math.max(start, (event.timestamp - meeting.audioStartEpochMs) / 1000);
-      timeline.push({
-        name: previous.name,
-        start,
-        end,
-      });
+      timeline.push({ name: previous.name, start, end });
     }
 
     previous = { ...event };
@@ -525,11 +645,7 @@ function buildDomTimeline(meeting, endEpochMs) {
   if (previous && previous.name) {
     const start = Math.max(0, (previous.timestamp - meeting.audioStartEpochMs) / 1000);
     const end = Math.max(start, (endEpochMs - meeting.audioStartEpochMs) / 1000);
-    timeline.push({
-      name: previous.name,
-      start,
-      end,
-    });
+    timeline.push({ name: previous.name, start, end });
   }
 
   return timeline;
@@ -541,7 +657,9 @@ function matchSpeakerIdsToRealNames(diarizationSegments, domTimeline) {
   for (const diarization of diarizationSegments || []) {
     for (const dom of domTimeline || []) {
       const overlap = getOverlapSeconds(diarization, dom);
-      if (overlap <= 0) continue;
+      if (overlap <= 0) {
+        continue;
+      }
 
       const existing = overlapBySpeaker.get(diarization.speaker_id) || new Map();
       existing.set(dom.name, (existing.get(dom.name) || 0) + overlap);
@@ -579,7 +697,9 @@ function findBestOverlap(segment, candidates, valueKey) {
 
   for (const candidate of candidates) {
     const overlap = getOverlapSeconds(segment, candidate);
-    if (overlap <= 0) continue;
+    if (overlap <= 0) {
+      continue;
+    }
 
     const score = overlap / duration;
     if (!best || score > best.score) {
@@ -610,9 +730,7 @@ function consolidateTranscript(transcript) {
     ) {
       previous.text = `${previous.text} ${segment.text}`.trim();
       previous.end = segment.end;
-      previous.confidence = Number(
-        ((previous.confidence + segment.confidence) / 2).toFixed(2)
-      );
+      previous.confidence = Number(((previous.confidence + segment.confidence) / 2).toFixed(2));
       continue;
     }
 
@@ -636,14 +754,11 @@ function buildMeetingInfo(meeting, transcript) {
     duration: meeting.startTime
       ? Math.max(
           0,
-          Math.round(
-            ((meeting.endEpochMs || Date.now()) -
-              new Date(meeting.startTime).getTime()) /
-              60000
-          )
+          Math.round(((meeting.endEpochMs || Date.now()) - new Date(meeting.startTime).getTime()) / 60000)
         )
       : 0,
     participants: [...participantSet].filter(Boolean),
+    corrected: Boolean(meeting.corrected),
   };
 }
 
@@ -660,13 +775,13 @@ function createMeetingState(tabId, message = {}) {
     audioStartEpochMs: null,
     participants: [],
     speakerEvents: [],
-    completedSpeakerTimeline: [],
     transcriptionSegments: [],
     diarizationSegments: [],
     captureStatus: "idle",
     captureError: null,
     serverStatus: "unknown",
     pendingFinalization: false,
+    finalizationTimerActive: false,
   };
 }
 
@@ -688,17 +803,48 @@ function mergeUniqueNames(existing, incoming) {
 }
 
 function getMeeting(tabId) {
-  if (!tabId) return null;
+  if (!tabId) {
+    return null;
+  }
   return activeMeetings.get(tabId) || null;
 }
 
 async function persistMeetingState(meeting) {
   activeMeetings.set(meeting.tabId, meeting);
-  await chrome.storage.local.set({
-    currentMeeting: {
-      ...meeting,
-    },
-  });
+
+  const stored = await chrome.storage.local.get(STORAGE_KEY);
+  const meetingsByTabId = stored[STORAGE_KEY] || {};
+  meetingsByTabId[String(meeting.tabId)] = pickPersistedMeetingState(meeting);
+  await chrome.storage.local.set({ [STORAGE_KEY]: meetingsByTabId });
+}
+
+async function removePersistedMeeting(tabId) {
+  const stored = await chrome.storage.local.get(STORAGE_KEY);
+  const meetingsByTabId = stored[STORAGE_KEY] || {};
+  delete meetingsByTabId[String(tabId)];
+  await chrome.storage.local.set({ [STORAGE_KEY]: meetingsByTabId });
+}
+
+function pickPersistedMeetingState(meeting) {
+  return {
+    tabId: meeting.tabId,
+    sessionId: meeting.sessionId,
+    platform: meeting.platform,
+    title: meeting.title,
+    startTime: meeting.startTime,
+    startEpochMs: meeting.startEpochMs,
+    endTime: meeting.endTime,
+    endEpochMs: meeting.endEpochMs,
+    audioStartEpochMs: meeting.audioStartEpochMs,
+    participants: [...(meeting.participants || [])],
+    speakerEvents: [...(meeting.speakerEvents || [])],
+    transcriptionSegments: [...(meeting.transcriptionSegments || [])],
+    diarizationSegments: [...(meeting.diarizationSegments || [])],
+    captureStatus: meeting.captureStatus,
+    captureError: meeting.captureError,
+    serverStatus: meeting.serverStatus,
+    pendingFinalization: meeting.pendingFinalization,
+  };
 }
 
 async function ensureOffscreenDocument() {
@@ -714,23 +860,91 @@ async function ensureOffscreenDocument() {
   await chrome.offscreen.createDocument({
     url: OFFSCREEN_DOCUMENT_PATH,
     reasons: ["USER_MEDIA"],
-    justification:
-      "Capture meeting tab audio and stream it to the local Whisper server.",
+    justification: "Capture meeting tab audio and stream it to the local Whisper server.",
   });
 }
 
 async function closeOffscreenDocumentIfIdle() {
-  const stillCapturing = [...activeMeetings.values()].some(
-    (meeting) =>
-      meeting.captureStatus === "capturing" || meeting.captureStatus === "starting"
+  const stillCapturing = [...activeMeetings.values()].some((meeting) =>
+    isCaptureLive(meeting.captureStatus)
   );
-  if (stillCapturing) return;
+  if (stillCapturing) {
+    return;
+  }
 
   try {
     await chrome.offscreen.closeDocument();
   } catch (error) {
     // No offscreen document open.
   }
+}
+
+function waitForServerReachability() {
+  const deadline = Date.now() + SERVER_RETRY_WINDOW_MS;
+
+  return new Promise((resolve) => {
+    const attempt = async () => {
+      const reachable = await pingWhisperServer();
+      if (reachable) {
+        resolve(true);
+        return;
+      }
+
+      if (Date.now() >= deadline) {
+        resolve(false);
+        return;
+      }
+
+      setTimeout(attempt, SERVER_RETRY_INTERVAL_MS);
+    };
+
+    attempt();
+  });
+}
+
+function pingWhisperServer() {
+  return new Promise((resolve) => {
+    let settled = false;
+    const socket = new WebSocket(SERVER_WS_URL);
+    const timeout = setTimeout(() => finish(false), 1200);
+
+    function finish(result) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      try {
+        socket.close();
+      } catch (error) {
+        // Ignore.
+      }
+      resolve(result);
+    }
+
+    socket.addEventListener("open", () => finish(true));
+    socket.addEventListener("error", () => finish(false));
+    socket.addEventListener("close", () => finish(false));
+  });
+}
+
+function scheduleFinalizeFallback(tabId) {
+  const meeting = getMeeting(tabId);
+  if (!meeting || meeting.finalizationTimerActive) {
+    return;
+  }
+
+  meeting.finalizationTimerActive = true;
+  setTimeout(() => {
+    const latest = getMeeting(tabId);
+    if (!latest) {
+      return;
+    }
+    latest.finalizationTimerActive = false;
+    finalizeMeetingIfReady(tabId).catch((error) => {
+      console.error("[MeetingTranscriber] Deferred finalize failed:", error);
+    });
+  }, FINALIZE_TIMEOUT_MS);
 }
 
 function saveMarkdownFile(content, filename) {
@@ -742,48 +956,67 @@ function saveMarkdownFile(content, filename) {
       url,
       filename,
       saveAs: false,
+      conflictAction: "uniquify",
     },
     () => URL.revokeObjectURL(url)
   );
 }
 
+function generateOutputFilename(meetingInfo) {
+  const base = generateFilename(meetingInfo);
+  if (!meetingInfo.corrected) {
+    return base;
+  }
+
+  const dotIndex = base.lastIndexOf(".md");
+  if (dotIndex === -1) {
+    return `${base}-corrected`;
+  }
+
+  return `${base.slice(0, dotIndex)}-corrected${base.slice(dotIndex)}`;
+}
+
 function updateBadge(tabId, count) {
-  if (!tabId) return;
+  if (!tabId) {
+    return;
+  }
   chrome.action.setBadgeText({ text: count > 0 ? String(count) : "●", tabId });
   chrome.action.setBadgeBackgroundColor({ color: "#e53e3e", tabId });
 }
 
 function clearBadge(tabId) {
-  if (!tabId) return;
+  if (!tabId) {
+    return;
+  }
   chrome.action.setBadgeText({ text: "", tabId });
 }
 
-chrome.tabs.onRemoved.addListener(async (tabId) => {
-  const meeting = activeMeetings.get(tabId);
-  if (meeting) {
-    meeting.endTime = new Date().toISOString();
-    meeting.endEpochMs = Date.now();
-    meeting.pendingFinalization = true;
-    await finalizeMeetingIfReady(tabId);
-    return;
-  }
+function isCaptureLive(status) {
+  return ["starting", "waiting_for_server", "capturing", "stopping"].includes(status);
+}
 
-  const stored = await chrome.storage.local.get("currentMeeting");
-  if (stored.currentMeeting?.tabId !== tabId) {
-    return;
-  }
+function dedupeTranscriptSegments(segments) {
+  const seen = new Set();
+  return segments.filter((segment) => {
+    const key = `${segment.start}:${segment.end}:${segment.text}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
 
-  const recovered = stored.currentMeeting;
-  const transcript = buildMergedTranscript(recovered);
-  if (transcript.length === 0) {
-    await chrome.storage.local.remove("currentMeeting");
-    return;
-  }
-
-  const meetingInfo = buildMeetingInfo(recovered, transcript);
-  saveMarkdownFile(
-    formatTranscriptAsMarkdown(transcript, meetingInfo),
-    generateFilename(meetingInfo)
-  );
-  await chrome.storage.local.remove("currentMeeting");
-});
+function dedupeDiarizationSegments(segments) {
+  const seen = new Set();
+  return segments
+    .sort((a, b) => a.start - b.start)
+    .filter((segment) => {
+      const key = `${segment.start}:${segment.end}:${segment.speaker_id}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+}

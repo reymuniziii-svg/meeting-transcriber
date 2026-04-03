@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -27,11 +28,10 @@ from server.whisper_utils import (  # noqa: E402
     diarize_with_pyannote,
     filter_hallucinations,
     find_whisper_model,
+    get_diarization_status,
     transcribe_with_whisper,
     write_pcm_wav,
 )
-
-
 class StreamingSession:
     """Handles one browser tab's live transcription session."""
 
@@ -41,17 +41,25 @@ class StreamingSession:
         self.model_path = model_path
         self.args = args
         self.audio_buffer = bytearray()
+        self.buffer_start_seconds = 0.0
         self.window_seconds = args.window_seconds
         self.overlap_seconds = args.overlap_seconds
         self.window_step_seconds = max(self.window_seconds - self.overlap_seconds, 1)
         self.diarization_interval_seconds = args.diarization_interval
+        self.diarization_chunk_overlap_seconds = 3.0
+        self.max_retained_seconds = max(
+            args.max_retained_seconds,
+            self.window_seconds + self.overlap_seconds + self.diarization_chunk_overlap_seconds,
+        )
         self.sample_rate = 16000
         self.session_id = "unknown"
         self.prompt = build_whisper_prompt(args.vocab, args.prompt)
         self.next_window_start = 0.0
         self.next_diarization_at = float(self.diarization_interval_seconds)
+        self.diarization_cursor = 0.0
         self.emitted_until = 0.0
         self.processing_lock = asyncio.Lock()
+        self.diarization_enabled = get_diarization_status() == "enabled"
 
     @property
     def bytes_per_second(self) -> int:
@@ -131,9 +139,11 @@ class StreamingSession:
                 if window_end >= total_duration and not has_full_window:
                     break
 
-            if (final and self.duration_seconds > 0) or (
-                self.duration_seconds >= self.next_diarization_at
-            ):
+            should_refresh_diarization = self.diarization_enabled and (
+                (final and self.duration_seconds > self.diarization_cursor)
+                or self.duration_seconds >= self.next_diarization_at
+            )
+            if should_refresh_diarization:
                 speakers = await asyncio.to_thread(self.run_diarization)
                 if speakers:
                     await self.websocket.send(
@@ -148,9 +158,11 @@ class StreamingSession:
                 while self.next_diarization_at <= self.duration_seconds:
                     self.next_diarization_at += self.diarization_interval_seconds
 
+            self.prune_audio_buffer()
+
     def transcribe_window(self, start_seconds: float, end_seconds: float) -> list[dict]:
-        start_byte = int(start_seconds * self.bytes_per_second)
-        end_byte = int(end_seconds * self.bytes_per_second)
+        start_byte = int((start_seconds - self.buffer_start_seconds) * self.bytes_per_second)
+        end_byte = int((end_seconds - self.buffer_start_seconds) * self.bytes_per_second)
         pcm_bytes = bytes(self.audio_buffer[start_byte:end_byte])
 
         if len(pcm_bytes) < self.bytes_per_second:
@@ -198,12 +210,21 @@ class StreamingSession:
         return adjusted_segments
 
     def run_diarization(self) -> list[dict]:
-        if not os.environ.get("HF_TOKEN"):
+        if not self.diarization_enabled or self.duration_seconds <= self.diarization_cursor:
+            return []
+
+        chunk_start = max(
+            0.0,
+            self.diarization_cursor - self.diarization_chunk_overlap_seconds,
+        )
+        start_byte = int((chunk_start - self.buffer_start_seconds) * self.bytes_per_second)
+        pcm_bytes = bytes(self.audio_buffer[start_byte:])
+        if len(pcm_bytes) < self.bytes_per_second:
             return []
 
         with tempfile.TemporaryDirectory(prefix="meeting-transcriber-diarization-") as tmpdir:
             audio_path = Path(tmpdir) / "meeting.wav"
-            write_pcm_wav(audio_path, bytes(self.audio_buffer), sample_rate=self.sample_rate)
+            write_pcm_wav(audio_path, pcm_bytes, sample_rate=self.sample_rate)
             speakers = diarize_with_pyannote(str(audio_path))
 
         normalized = []
@@ -221,14 +242,32 @@ class StreamingSession:
         for speaker in speakers:
             normalized.append(
                 {
-                    "start": round(speaker["start"], 3),
-                    "end": round(speaker["end"], 3),
+                    "start": round(speaker["start"] + chunk_start, 3),
+                    "end": round(speaker["end"] + chunk_start, 3),
                     "speaker_id": speaker["speaker"],
                     "label": speaker_map[speaker["speaker"]],
                 }
             )
 
+        self.diarization_cursor = self.duration_seconds
         return normalized
+
+    def prune_audio_buffer(self) -> None:
+        retain_from = min(self.next_window_start, self.diarization_cursor)
+        retain_from = max(0.0, retain_from - max(self.overlap_seconds, self.diarization_chunk_overlap_seconds))
+        if self.duration_seconds - retain_from > self.max_retained_seconds:
+            retain_from = max(0.0, self.duration_seconds - self.max_retained_seconds)
+
+        if retain_from <= self.buffer_start_seconds:
+            return
+
+        trim_seconds = retain_from - self.buffer_start_seconds
+        trim_bytes = int(trim_seconds * self.bytes_per_second)
+        if trim_bytes <= 0:
+            return
+
+        del self.audio_buffer[:trim_bytes]
+        self.buffer_start_seconds = retain_from
 
 
 async def handle_connection(websocket, whisper_cmd: str, model_path: str, args) -> None:
@@ -251,18 +290,28 @@ async def handle_connection(websocket, whisper_cmd: str, model_path: str, args) 
 
 
 async def main_async(args) -> None:
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="[%(asctime)s] %(levelname)s %(message)s",
+    )
     whisper_cmd = check_dependencies()
     model_path = find_whisper_model()
+    diarization_status = get_diarization_status()
 
     print("=" * 56)
     print("Meeting Transcriber — Local Whisper Server")
     print("=" * 56)
     print(f"Listening on ws://{args.host}:{args.port}")
     print(f"Model: {model_path}")
+    print(f"Audio retention cap: {args.max_retained_seconds} seconds in memory")
     if args.prompt or args.vocab:
         print(f"Prompt: {build_whisper_prompt(args.vocab, args.prompt)}")
-    if not os.environ.get("HF_TOKEN"):
-        print("HF_TOKEN not set. Pyannote diarization will be skipped.")
+    if diarization_status == "enabled":
+        print("Pyannote diarization: enabled")
+    elif diarization_status == "missing_hf_token":
+        print("Pyannote diarization: disabled (HF_TOKEN not set)")
+    else:
+        print("Pyannote diarization: disabled (pyannote.audio unavailable)")
     print("")
 
     async with websockets.serve(
@@ -311,6 +360,17 @@ def parse_args():
         "--no-filter",
         action="store_true",
         help="Disable hallucination filtering",
+    )
+    parser.add_argument(
+        "--max-retained-seconds",
+        type=int,
+        default=2700,
+        help="Maximum PCM audio seconds retained in memory per meeting session",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Logging level for the local transcription server",
     )
     return parser.parse_args()
 

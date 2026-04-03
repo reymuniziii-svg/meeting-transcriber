@@ -2,6 +2,8 @@
  * Popup UI logic.
  */
 
+const SERVER_WS_URL = "ws://127.0.0.1:9090";
+
 document.addEventListener("DOMContentLoaded", async () => {
   const statusIndicator = document.getElementById("status-indicator");
   const statusText = document.getElementById("status-text");
@@ -22,55 +24,28 @@ document.addEventListener("DOMContentLoaded", async () => {
   const tabId = activeTab?.id;
 
   const serverConnected = await pingWhisperServer();
-  serverStatusBox.classList.remove("hidden");
-  serverStatusText.textContent = serverConnected ? "Connected" : "Disconnected";
-  serverStatusText.className = serverConnected ? "server-ok" : "server-bad";
-
-  if (!serverConnected) {
-    serverWarning.classList.remove("hidden");
-    serverWarningText.textContent =
-      "Whisper server not running. Start it with ./start-server.sh";
-  }
+  renderServerHealth(serverStatusBox, serverStatusText, serverWarning, serverWarningText, serverConnected);
 
   if (tabId) {
     const response = await chrome.runtime.sendMessage({ type: "getStatus", tabId });
-    const meeting = response?.meeting;
-
-    if (meeting) {
-      statusIndicator.className = "status recording";
-      statusText.textContent = "Meeting detected";
-      meetingInfoSection.classList.remove("hidden");
-      infoPlatform.textContent = meeting.platform;
-      infoSegments.textContent = meeting.segmentCount;
-      infoCapture.textContent = formatCaptureStatus(meeting.captureStatus);
-      btnDownload.classList.remove("hidden");
-
-      if (
-        meeting.captureStatus === "awaiting_user_gesture" ||
-        meeting.captureStatus === "idle" ||
-        meeting.captureStatus === "error"
-      ) {
-        btnStartCapture.classList.remove("hidden");
-      }
-
-      if (meeting.captureError) {
-        serverWarning.classList.remove("hidden");
-        serverWarningText.textContent = meeting.captureError;
-      }
-    }
+    renderMeeting(response?.meeting);
   }
 
   const result = await chrome.storage.session.get("selectorWarning");
   if (result.selectorWarning && Date.now() - result.selectorWarning.timestamp < 3600000) {
     selectorWarning.classList.remove("hidden");
-    warningText.textContent = `${result.selectorWarning.platform}: ${result.selectorWarning.failures} selector(s) may be outdated.`;
+    warningText.textContent = `${result.selectorWarning.platform}: ${result.selectorWarning.failures} selector group(s) failed repeated checks.`;
   }
 
   btnStartCapture.addEventListener("click", async () => {
-    if (!tabId) return;
+    if (!tabId) {
+      return;
+    }
 
+    serverWarning.classList.add("hidden");
     btnStartCapture.disabled = true;
-    btnStartCapture.textContent = "Connecting...";
+    btnStartCapture.textContent = "Waiting for local server...";
+    infoCapture.textContent = "Waiting for local server";
 
     const result = await chrome.runtime.sendMessage({
       type: "beginCapture",
@@ -79,21 +54,26 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     if (!result?.ok) {
       serverWarning.classList.remove("hidden");
-      serverWarningText.textContent = result?.error || "Could not connect audio capture.";
+      serverWarningText.textContent = result?.error || "Capture failed.";
+      infoCapture.textContent = "Capture failed";
       btnStartCapture.disabled = false;
       btnStartCapture.textContent = "Connect Audio";
       return;
     }
 
-    infoCapture.textContent = "Starting";
-    btnStartCapture.textContent = "Connected";
-    setTimeout(() => {
-      btnStartCapture.classList.add("hidden");
+    infoCapture.textContent = formatCaptureStatus(result.status || "starting");
+    btnStartCapture.textContent = "Connecting...";
+
+    setTimeout(async () => {
+      const refreshed = await chrome.runtime.sendMessage({ type: "getStatus", tabId });
+      renderMeeting(refreshed?.meeting);
     }, 1200);
   });
 
   btnDownload.addEventListener("click", async () => {
-    if (!tabId) return;
+    if (!tabId) {
+      return;
+    }
 
     const result = await chrome.runtime.sendMessage({
       type: "downloadCurrentTranscript",
@@ -105,7 +85,52 @@ document.addEventListener("DOMContentLoaded", async () => {
       btnDownload.textContent = "Download Transcript";
     }, 2000);
   });
+
+  function renderMeeting(meeting) {
+    if (!meeting) {
+      statusIndicator.className = "status idle";
+      statusText.textContent = "No active meeting";
+      meetingInfoSection.classList.add("hidden");
+      btnStartCapture.classList.add("hidden");
+      btnDownload.classList.add("hidden");
+      return;
+    }
+
+    statusIndicator.className = "status recording";
+    statusText.textContent = "Meeting detected";
+    meetingInfoSection.classList.remove("hidden");
+    infoPlatform.textContent = meeting.platform;
+    infoSegments.textContent = meeting.segmentCount;
+    infoCapture.textContent = formatCaptureStatus(meeting.captureStatus);
+
+    btnDownload.classList.toggle("hidden", meeting.segmentCount === 0);
+
+    const shouldShowConnect = ["idle", "awaiting_user_gesture", "error", "stopped"].includes(
+      meeting.captureStatus
+    );
+    btnStartCapture.classList.toggle("hidden", !shouldShowConnect);
+    btnStartCapture.disabled = false;
+    btnStartCapture.textContent =
+      meeting.captureStatus === "awaiting_user_gesture" ? "Grant Audio Permission" : "Connect Audio";
+
+    if (meeting.captureError) {
+      serverWarning.classList.remove("hidden");
+      serverWarningText.textContent = meeting.captureError;
+    }
+  }
 });
+
+function renderServerHealth(serverStatusBox, serverStatusText, serverWarning, serverWarningText, connected) {
+  serverStatusBox.classList.remove("hidden");
+  serverStatusText.textContent = connected ? "Connected" : "Waiting";
+  serverStatusText.className = connected ? "server-ok" : "server-bad";
+
+  if (!connected) {
+    serverWarning.classList.remove("hidden");
+    serverWarningText.textContent =
+      "Waiting for local server. launchd should restart it automatically after install.";
+  }
+}
 
 function formatCaptureStatus(status) {
   switch (status) {
@@ -113,10 +138,16 @@ function formatCaptureStatus(status) {
       return "Connected";
     case "starting":
       return "Starting";
+    case "waiting_for_server":
+      return "Waiting for local server";
     case "awaiting_user_gesture":
-      return "Needs click";
+      return "Audio capture permission needed";
+    case "stopping":
+      return "Stopping";
     case "error":
-      return "Error";
+      return "Capture failed";
+    case "stopped":
+      return "Stopped";
     default:
       return "Idle";
   }
@@ -125,16 +156,20 @@ function formatCaptureStatus(status) {
 function pingWhisperServer() {
   return new Promise((resolve) => {
     let settled = false;
-    const socket = new WebSocket("ws://127.0.0.1:9090");
+    const socket = new WebSocket(SERVER_WS_URL);
     const timeout = setTimeout(() => finish(false), 1500);
 
     function finish(result) {
-      if (settled) return;
+      if (settled) {
+        return;
+      }
       settled = true;
       clearTimeout(timeout);
       try {
         socket.close();
-      } catch (error) {}
+      } catch (error) {
+        // Ignore.
+      }
       resolve(result);
     }
 

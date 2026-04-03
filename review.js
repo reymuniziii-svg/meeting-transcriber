@@ -1,6 +1,6 @@
 /**
  * Post-meeting review page.
- * Lets user verify/correct speaker names and re-save the transcript.
+ * Lets the user verify/correct speaker names and re-save the transcript.
  */
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -8,204 +8,277 @@ document.addEventListener("DOMContentLoaded", () => {
 
   chrome.storage.local.get("lastTranscript", (result) => {
     const data = result.lastTranscript;
-    if (!data || !data.transcript || data.transcript.length === 0) {
-      return; // Show empty state
+    if (!data || !Array.isArray(data.transcript) || data.transcript.length === 0) {
+      return;
     }
 
-    renderReview(data.transcript, data.meetingInfo);
+    renderReview(contentEl, data.transcript, data.meetingInfo || {});
   });
+});
 
-  function renderReview(transcript, meetingInfo) {
-    // Collect unique speakers and their word counts
-    const speakerStats = {};
-    for (const seg of transcript) {
-      const sp = seg.speaker;
-      if (!speakerStats[sp]) {
-        speakerStats[sp] = { words: 0, segments: 0, firstSeen: seg.timestamp };
-      }
-      speakerStats[sp].words += (seg.text || "").split(/\s+/).length;
-      speakerStats[sp].segments += 1;
+function renderReview(contentEl, transcript, meetingInfo) {
+  contentEl.replaceChildren();
+
+  const speakerStats = buildSpeakerStats(transcript);
+  const speakers = Object.keys(speakerStats);
+  const participants = meetingInfo.participants || [];
+
+  contentEl.appendChild(buildMetaBlock(transcript, meetingInfo, speakers.length));
+  contentEl.appendChild(buildSpeakerMap(speakers, speakerStats, participants));
+  contentEl.appendChild(buildActions(transcript, meetingInfo));
+  contentEl.appendChild(buildTranscriptPreview(transcript));
+
+  document.querySelectorAll(".speaker-input").forEach((input) => {
+    input.addEventListener("input", () => {
+      const original = input.dataset.original;
+      const newName = input.value.trim() || original;
+      document.querySelectorAll(`.segment[data-speaker-key="${cssEscape(original)}"] .segment-speaker`)
+        .forEach((el) => {
+          el.textContent = newName;
+        });
+    });
+  });
+}
+
+function buildSpeakerStats(transcript) {
+  const stats = {};
+  for (const segment of transcript) {
+    const speaker = segment.speaker || "Unknown Speaker";
+    if (!stats[speaker]) {
+      stats[speaker] = {
+        words: 0,
+        segments: 0,
+        firstSeen: segment.timestamp,
+      };
     }
+    stats[speaker].words += (segment.text || "").trim().split(/\s+/).filter(Boolean).length;
+    stats[speaker].segments += 1;
+  }
+  return stats;
+}
 
-    const speakers = Object.keys(speakerStats);
-    const participants = meetingInfo.participants || [];
+function buildMetaBlock(transcript, meetingInfo, speakerCount) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "meta";
 
-    // Build the page
-    let html = "";
+  const row = document.createElement("div");
+  row.className = "meta-row";
+  wrapper.appendChild(row);
 
-    // Meta info
-    const date = meetingInfo.startTime
+  appendMetaItem(row, meetingInfo.platform || "Unknown", true);
+  appendMetaItem(
+    row,
+    meetingInfo.startTime
       ? new Date(meetingInfo.startTime).toLocaleDateString("en-US", {
           weekday: "short",
           month: "short",
           day: "numeric",
           year: "numeric",
         })
-      : "Unknown";
-    const duration = meetingInfo.duration
-      ? `${meetingInfo.duration} min`
-      : "Unknown";
+      : "Unknown"
+  );
+  appendMetaItem(row, meetingInfo.duration ? `${meetingInfo.duration} min` : "Unknown");
+  appendMetaItem(row, `${transcript.length} segments`);
+  appendMetaItem(row, `${speakerCount} speakers`);
 
-    html += `
-      <div class="meta">
-        <div class="meta-row">
-          <span class="meta-item"><strong>${meetingInfo.platform || "Unknown"}</strong></span>
-          <span class="meta-item">${date}</span>
-          <span class="meta-item">${duration}</span>
-          <span class="meta-item">${transcript.length} segments</span>
-          <span class="meta-item">${speakers.length} speakers</span>
-        </div>
-      </div>
-    `;
+  return wrapper;
+}
 
-    // Speaker renaming
-    html += `
-      <div class="speaker-map">
-        <h2>Speaker Names</h2>
-        <p>Verify these are correct. Edit any that are wrong, then click "Save Corrected Transcript" below.</p>
-    `;
+function appendMetaItem(row, value, strong = false) {
+  const item = document.createElement("span");
+  item.className = "meta-item";
+  if (strong) {
+    const strongEl = document.createElement("strong");
+    strongEl.textContent = value;
+    item.appendChild(strongEl);
+  } else {
+    item.textContent = value;
+  }
+  row.appendChild(item);
+}
 
-    for (const speaker of speakers) {
-      const stats = speakerStats[speaker];
-      // Pre-fill with participant name if we have a matching index
-      const suggestedName =
-        participants.length > 0 ? "" : "";
+function buildSpeakerMap(speakers, speakerStats, participants) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "speaker-map";
 
-      html += `
-        <div class="speaker-row">
-          <span class="speaker-label">${speaker}</span>
-          <span class="speaker-arrow">&rarr;</span>
-          <input
-            type="text"
-            class="speaker-input"
-            data-original="${speaker}"
-            placeholder="${speaker} (keep as-is)"
-            value="${suggestedName}"
-          />
-          <span class="speaker-words">${stats.words} words</span>
-        </div>
-      `;
-    }
+  const title = document.createElement("h2");
+  title.textContent = "Speaker Names";
+  wrapper.appendChild(title);
 
-    if (participants.length > 0) {
-      html += `
-        <p style="margin-top: 12px; font-size: 12px; color: #666;">
-          Detected participants: ${participants.join(", ")}
-        </p>
-      `;
-    }
+  const intro = document.createElement("p");
+  intro.textContent =
+    'Verify these are correct. Edit any that are wrong, then click "Save Corrected Transcript" below.';
+  wrapper.appendChild(intro);
 
-    html += `</div>`;
+  for (const speaker of speakers) {
+    const stats = speakerStats[speaker];
+    const row = document.createElement("div");
+    row.className = "speaker-row";
 
-    // Actions
-    html += `
-      <div class="actions">
-        <button class="btn btn-primary" id="btn-save">Save Corrected Transcript</button>
-        <button class="btn btn-secondary" id="btn-dismiss">Looks Good, Dismiss</button>
-      </div>
-      <p class="success-msg" id="success-msg">Corrected transcript saved!</p>
-    `;
+    const label = document.createElement("span");
+    label.className = "speaker-label";
+    label.textContent = speaker;
+    row.appendChild(label);
 
-    // Transcript preview (first 30 segments)
-    const previewSegments = transcript.slice(0, 30);
-    html += `
-      <div class="transcript-section">
-        <h2>Transcript Preview${transcript.length > 30 ? ` (first 30 of ${transcript.length})` : ""}</h2>
-    `;
+    const arrow = document.createElement("span");
+    arrow.className = "speaker-arrow";
+    arrow.textContent = "→";
+    row.appendChild(arrow);
 
-    for (const seg of previewSegments) {
-      const time = seg.timestamp
-        ? new Date(seg.timestamp).toLocaleTimeString("en-US", {
-            hour: "numeric",
-            minute: "2-digit",
-          })
-        : "";
-      const confidence = seg.confidence || 1;
-      const lowConf = confidence < 0.3 ? " low-confidence" : "";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "speaker-input";
+    input.dataset.original = speaker;
+    input.placeholder = `${speaker} (keep as-is)`;
+    input.value = "";
+    row.appendChild(input);
 
-      html += `
-        <div class="segment${lowConf}" data-speaker="${seg.speaker}">
-          <div class="segment-header">
-            <span class="segment-speaker">${seg.speaker}</span>
-            ${time ? `<span class="segment-time">(${time})</span>` : ""}
-          </div>
-          <div class="segment-text">${seg.text}</div>
-        </div>
-      `;
-    }
+    const words = document.createElement("span");
+    words.className = "speaker-words";
+    words.textContent = `${stats.words} words`;
+    row.appendChild(words);
 
-    html += `</div>`;
-
-    contentEl.innerHTML = html;
-
-    // Wire up buttons
-    document.getElementById("btn-save").addEventListener("click", () => {
-      saveWithCorrections(transcript, meetingInfo);
-    });
-
-    document.getElementById("btn-dismiss").addEventListener("click", () => {
-      window.close();
-    });
-
-    // Live preview: update transcript preview when speaker names change
-    const inputs = document.querySelectorAll(".speaker-input");
-    inputs.forEach((input) => {
-      input.addEventListener("input", () => {
-        const original = input.dataset.original;
-        const newName = input.value.trim() || original;
-        // Update preview
-        const segs = document.querySelectorAll(
-          `.segment[data-speaker="${original}"] .segment-speaker`
-        );
-        segs.forEach((el) => {
-          el.textContent = newName;
-        });
-      });
-    });
+    wrapper.appendChild(row);
   }
 
-  function saveWithCorrections(transcript, meetingInfo) {
-    // Build speaker rename map
-    const renameMap = {};
-    document.querySelectorAll(".speaker-input").forEach((input) => {
-      const original = input.dataset.original;
-      const newName = input.value.trim();
-      if (newName && newName !== original) {
-        renameMap[original] = newName;
-      }
-    });
-
-    // Apply renames
-    const corrected = transcript.map((seg) => ({
-      ...seg,
-      speaker: renameMap[seg.speaker] || seg.speaker,
-    }));
-
-    // Update participants
-    const correctedInfo = {
-      ...meetingInfo,
-      participants: [
-        ...new Set(corrected.map((s) => s.speaker)),
-      ],
-    };
-
-    // Send to background for re-save
-    chrome.runtime.sendMessage({
-      type: "downloadTranscript",
-      transcript: corrected,
-      meetingInfo: correctedInfo,
-    });
-
-    // Show success
-    const btn = document.getElementById("btn-save");
-    const msg = document.getElementById("success-msg");
-    btn.disabled = true;
-    btn.textContent = "Saved!";
-    msg.style.display = "block";
-
-    setTimeout(() => {
-      btn.disabled = false;
-      btn.textContent = "Save Corrected Transcript";
-    }, 3000);
+  if (participants.length > 0) {
+    const participantsEl = document.createElement("p");
+    participantsEl.style.marginTop = "12px";
+    participantsEl.style.fontSize = "12px";
+    participantsEl.style.color = "#666";
+    participantsEl.textContent = `Detected participants: ${participants.join(", ")}`;
+    wrapper.appendChild(participantsEl);
   }
-});
+
+  return wrapper;
+}
+
+function buildActions(transcript, meetingInfo) {
+  const wrapper = document.createElement("div");
+
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  wrapper.appendChild(actions);
+
+  const saveButton = document.createElement("button");
+  saveButton.className = "btn btn-primary";
+  saveButton.id = "btn-save";
+  saveButton.textContent = "Save Corrected Transcript";
+  actions.appendChild(saveButton);
+
+  const dismissButton = document.createElement("button");
+  dismissButton.className = "btn btn-secondary";
+  dismissButton.id = "btn-dismiss";
+  dismissButton.textContent = "Looks Good, Dismiss";
+  actions.appendChild(dismissButton);
+
+  const success = document.createElement("p");
+  success.className = "success-msg";
+  success.id = "success-msg";
+  success.textContent = "Corrected transcript saved!";
+  wrapper.appendChild(success);
+
+  saveButton.addEventListener("click", async () => {
+    saveButton.disabled = true;
+    saveButton.textContent = "Saving...";
+    success.style.display = "none";
+
+    const result = await saveWithCorrections(transcript, meetingInfo);
+    if (result?.ok) {
+      saveButton.textContent = "Saved!";
+      success.style.display = "block";
+    } else {
+      saveButton.disabled = false;
+      saveButton.textContent = "Save Corrected Transcript";
+      window.alert(result?.error || "Could not save corrected transcript.");
+    }
+  });
+
+  dismissButton.addEventListener("click", () => {
+    window.close();
+  });
+
+  return wrapper;
+}
+
+function buildTranscriptPreview(transcript) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "transcript-section";
+
+  const title = document.createElement("h2");
+  title.textContent =
+    transcript.length > 30
+      ? `Transcript Preview (first 30 of ${transcript.length})`
+      : "Transcript Preview";
+  wrapper.appendChild(title);
+
+  for (const segment of transcript.slice(0, 30)) {
+    const segmentEl = document.createElement("div");
+    segmentEl.className = `segment${(segment.confidence || 1) < 0.3 ? " low-confidence" : ""}`;
+    segmentEl.dataset.speakerKey = segment.speaker || "Unknown Speaker";
+
+    const header = document.createElement("div");
+    header.className = "segment-header";
+    segmentEl.appendChild(header);
+
+    const speaker = document.createElement("span");
+    speaker.className = "segment-speaker";
+    speaker.textContent = segment.speaker || "Unknown Speaker";
+    header.appendChild(speaker);
+
+    if (segment.timestamp) {
+      const time = document.createElement("span");
+      time.className = "segment-time";
+      time.textContent = ` (${new Date(segment.timestamp).toLocaleTimeString("en-US", {
+        hour: "numeric",
+        minute: "2-digit",
+      })})`;
+      header.appendChild(time);
+    }
+
+    const text = document.createElement("div");
+    text.className = "segment-text";
+    text.textContent = segment.text || "";
+    segmentEl.appendChild(text);
+
+    wrapper.appendChild(segmentEl);
+  }
+
+  return wrapper;
+}
+
+async function saveWithCorrections(transcript, meetingInfo) {
+  const renameMap = {};
+  document.querySelectorAll(".speaker-input").forEach((input) => {
+    const original = input.dataset.original;
+    const newName = input.value.trim();
+    if (newName && newName !== original) {
+      renameMap[original] = newName;
+    }
+  });
+
+  const corrected = transcript.map((segment) => ({
+    ...segment,
+    speaker: renameMap[segment.speaker] || segment.speaker,
+  }));
+
+  const correctedInfo = {
+    ...meetingInfo,
+    participants: [...new Set(corrected.map((segment) => segment.speaker).filter(Boolean))],
+    corrected: true,
+  };
+
+  return chrome.runtime.sendMessage({
+    type: "downloadTranscript",
+    transcript: corrected,
+    meetingInfo: correctedInfo,
+  });
+}
+
+function cssEscape(value) {
+  if (window.CSS && typeof window.CSS.escape === "function") {
+    return window.CSS.escape(value);
+  }
+
+  return String(value).replace(/["\\]/g, "\\$&");
+}

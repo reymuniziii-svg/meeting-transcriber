@@ -21,13 +21,16 @@
       "[data-self-name]",
       "[data-participant-name]",
       "[data-requested-participant-name]",
+      '[data-participant-id] span.notranslate',
+      'button[aria-label^="More options for "]',
       '[aria-label*=" is speaking"]',
       'img[alt][data-iml]'
     ],
     activeSpeaker: [
       '[aria-label*=" is speaking"]',
       '[data-active-speaker="true"] [data-participant-name]',
-      '[data-active-speaker="true"] [data-self-name]'
+      '[data-active-speaker="true"] [data-self-name]',
+      '[data-active-speaker="true"] span.notranslate'
     ],
     captionsContainer: 'div[role="region"][tabindex="0"]',
     captionText: 'div[jsname="tgaKEf"], [data-message-text]'
@@ -37,6 +40,13 @@
     const usernameEl = document.querySelector(SELECTORS.username);
     if (usernameEl) {
       username = usernameEl.textContent.trim();
+    }
+
+    if (!username) {
+      const moreOpts = document.querySelector('button[aria-label^="More options for "]');
+      if (moreOpts) {
+        username = moreOpts.getAttribute("aria-label").replace(/^More options for /, "").trim();
+      }
     }
 
     meetingDetectionInterval = setInterval(detectMeeting, 2000);
@@ -62,7 +72,14 @@
     SelectorValidator.validate(PLATFORM, {
       "Leave button": SELECTORS.callEndButton,
       "Participant names": SELECTORS.participantNames,
-      "Active speaker": SELECTORS.activeSpeaker
+      "Active speaker": {
+        selectors: SELECTORS.activeSpeaker,
+        optional: true
+      },
+      "Caption structure": {
+        selectors: [SELECTORS.captionsContainer, SELECTORS.captionText],
+        optional: true
+      }
     });
 
     participantPollInterval = setInterval(() => {
@@ -123,6 +140,26 @@
       }
     }
 
+    // Fallback: find the tile with a speaking border highlight
+    const tiles = document.querySelectorAll("[data-participant-id]");
+    for (const tile of tiles) {
+      const style = window.getComputedStyle(tile);
+      const childDivs = tile.querySelectorAll("div");
+      let hasSpeakingIndicator = false;
+      for (const div of childDivs) {
+        const cs = window.getComputedStyle(div);
+        if (cs.borderColor && /rgb\(26, 115, 232\)|rgb\(66, 133, 244\)|#1a73e8|#4285f4/i.test(cs.borderColor)) {
+          hasSpeakingIndicator = true;
+          break;
+        }
+      }
+      if (hasSpeakingIndicator) {
+        const nameSpan = tile.querySelector("span.notranslate");
+        const name = nameSpan?.textContent?.trim();
+        if (name) return name === "You" && username ? username : name;
+      }
+    }
+
     return detectCaptionSpeaker();
   }
 
@@ -151,7 +188,7 @@
         if (name) return name;
       }
 
-      const namedChild = parent.querySelector("[data-self-name], [data-participant-name]");
+      const namedChild = parent.querySelector("[data-self-name], [data-participant-name], span.notranslate");
       const childName = extractNameFromElement(namedChild);
       if (childName) return childName;
 
@@ -174,14 +211,15 @@
 
     if (!raw) return null;
 
-    const cleaned = raw
+    let cleaned = raw
+      .replace(/^More options for /i, "")
       .replace(/\bis speaking\b/i, "")
       .replace(/\s+/g, " ")
       .replace(/:$/, "")
       .trim();
 
     if (!cleaned || cleaned.length > 80) return null;
-    if (/leave|captions|present|meeting details/i.test(cleaned)) return null;
+    if (/leave|captions|present|meeting details|reframe|backgrounds|more_vert|visual_effects/i.test(cleaned)) return null;
 
     return cleaned;
   }

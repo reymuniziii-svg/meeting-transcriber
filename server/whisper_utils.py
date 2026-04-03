@@ -13,6 +13,7 @@ import sys
 import wave
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 
 HALLUCINATION_PATTERNS = [
@@ -35,6 +36,11 @@ HALLUCINATION_REGEXES = [
 
 MIN_SEGMENT_DURATION = 0.3
 MAX_WORDS_FOR_SHORT_SEGMENT = 2
+PYANNOTE_MODEL_NAME = "pyannote/speaker-diarization-3.1"
+
+_SILERO_CACHE: tuple[Any, tuple[Any, Any, Any, Any, Any]] | None = None
+_PYANNOTE_PIPELINE = None
+_PYANNOTE_STATUS = "unchecked"
 
 
 def build_whisper_prompt(vocab: str | None = None, prompt: str | None = None) -> str | None:
@@ -55,40 +61,36 @@ def build_whisper_prompt(vocab: str | None = None, prompt: str | None = None) ->
 
 
 def check_dependencies() -> str:
-    """Verify all required dependencies are available."""
-    errors = []
-
+    """Verify required runtime dependencies and return the whisper command."""
     whisper_cmd = find_whisper_command()
     if not whisper_cmd:
-        errors.append("whisper.cpp not found. Run ./install.sh from project root.")
-
-    try:
-        import pyannote.audio  # noqa: F401
-    except ImportError:
-        errors.append("pyannote.audio not found. Run ./install.sh from project root.")
-
-    if errors:
         print("Missing dependencies:")
-        for error in errors:
-            print(f"  \u2717 {error}")
+        print("  x whisper.cpp not found. Run ./install.sh from project root.")
         sys.exit(1)
-
     return whisper_cmd
 
 
 def find_whisper_command() -> str | None:
-    """Find the whisper.cpp binary."""
-    candidates = ["whisper-cpp", "whisper", "main"]
+    """Find the whisper.cpp-compatible binary."""
+    candidates = ["whisper-cpp", "whisper-cli", "whisper", "main"]
     for command in candidates:
         try:
-            subprocess.run([command, "--help"], capture_output=True, timeout=5)
-            return command
+            result = subprocess.run(
+                [command, "--help"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             continue
 
-    brew_path = Path("/opt/homebrew/bin/whisper-cpp")
-    if brew_path.exists():
-        return str(brew_path)
+        if result.returncode == 0 or result.returncode == 1:
+            return command
+
+    for brew_name in ["whisper-cpp", "whisper-cli"]:
+        brew_path = Path(f"/opt/homebrew/bin/{brew_name}")
+        if brew_path.exists():
+            return str(brew_path)
 
     return None
 
@@ -133,19 +135,29 @@ def write_pcm_wav(audio_path: str | Path, pcm_bytes: bytes, sample_rate: int = 1
         wav_file.writeframes(pcm_bytes)
 
 
+def get_silero_vad():
+    """Load and cache Silero VAD once per server process."""
+    global _SILERO_CACHE
+    if _SILERO_CACHE is not None:
+        return _SILERO_CACHE
+
+    import torch
+
+    _SILERO_CACHE = torch.hub.load(
+        "snakers4/silero-vad",
+        "silero_vad",
+        trust_repo=True,
+    )
+    return _SILERO_CACHE
+
+
 def detect_speech_segments(audio_path: str) -> list[tuple[float, float]] | None:
     """
     Use Silero VAD to detect speech-containing segments.
     Returns None when VAD fails, [] when silence is confirmed.
     """
     try:
-        import torch
-
-        model, utils = torch.hub.load(
-            "snakers4/silero-vad",
-            "silero_vad",
-            trust_repo=True,
-        )
+        model, utils = get_silero_vad()
         get_speech_timestamps, _, read_audio, _, _ = utils
 
         wav = read_audio(audio_path, sampling_rate=16000)
@@ -275,16 +287,44 @@ def filter_hallucinations(
     return filtered
 
 
-def diarize_with_pyannote(audio_path: str) -> list[dict]:
-    """Run pyannote speaker diarization. Returns speaker segments."""
+def get_diarization_status() -> str:
+    """
+    Return diarization availability:
+    - enabled
+    - missing_hf_token
+    - unavailable
+    """
+    global _PYANNOTE_STATUS
+
+    if not os.environ.get("HF_TOKEN"):
+        _PYANNOTE_STATUS = "missing_hf_token"
+        return _PYANNOTE_STATUS
+
+    if _PYANNOTE_STATUS == "unchecked":
+        try:
+            _build_pyannote_pipeline()
+        except Exception:
+            _PYANNOTE_STATUS = "unavailable"
+
+    return _PYANNOTE_STATUS
+
+
+def _build_pyannote_pipeline():
+    global _PYANNOTE_PIPELINE, _PYANNOTE_STATUS
+
+    if _PYANNOTE_PIPELINE is not None:
+        _PYANNOTE_STATUS = "enabled"
+        return _PYANNOTE_PIPELINE
+
     from pyannote.audio import Pipeline
 
     hf_token = os.environ.get("HF_TOKEN")
     if not hf_token:
-        return []
+        _PYANNOTE_STATUS = "missing_hf_token"
+        return None
 
     pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
+        PYANNOTE_MODEL_NAME,
         use_auth_token=hf_token,
     )
 
@@ -295,6 +335,21 @@ def diarize_with_pyannote(audio_path: str) -> list[dict]:
             pipeline.to("mps")
     except Exception:
         pass
+
+    _PYANNOTE_PIPELINE = pipeline
+    _PYANNOTE_STATUS = "enabled"
+    return _PYANNOTE_PIPELINE
+
+
+def diarize_with_pyannote(audio_path: str) -> list[dict]:
+    """Run pyannote speaker diarization. Returns speaker segments."""
+    try:
+        pipeline = _build_pyannote_pipeline()
+    except Exception:
+        return []
+
+    if pipeline is None:
+        return []
 
     diarization = pipeline(audio_path)
     speaker_segments = []
@@ -349,3 +404,11 @@ def merge_transcription_and_diarization(
         )
 
     return merged
+
+
+def reset_runtime_caches() -> None:
+    """Test helper for clearing cached models/pipelines."""
+    global _SILERO_CACHE, _PYANNOTE_PIPELINE, _PYANNOTE_STATUS
+    _SILERO_CACHE = None
+    _PYANNOTE_PIPELINE = None
+    _PYANNOTE_STATUS = "unchecked"
