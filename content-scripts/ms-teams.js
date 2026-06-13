@@ -133,12 +133,5 @@
     hasStarted = false;
   }
 
-  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === "getMeetingSnapshot") {
-      sendResponse(SpeakerTracker.getSnapshot());
-      return true;
-    }
-  });
-
   init();
 })();

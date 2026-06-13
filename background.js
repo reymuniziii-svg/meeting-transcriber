@@ -16,15 +16,19 @@ const FINALIZE_TIMEOUT_MS = 2000;
 
 const activeMeetings = new Map();
 
+// Cold-worker recovery runs exactly once per worker lifetime (ensureMeetingsLoaded).
+let recoveryComplete = false;
+let recoveryPromise = null;
+
 chrome.runtime.onInstalled.addListener(() => {
-  rehydrateMeetings().catch((error) => {
-    console.error("[MeetingTranscriber] Rehydrate failed on install:", error);
+  ensureMeetingsLoaded().catch((error) => {
+    console.error("[MeetingTranscriber] Recovery failed on install:", error);
   });
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  rehydrateMeetings().catch((error) => {
-    console.error("[MeetingTranscriber] Rehydrate failed on startup:", error);
+  ensureMeetingsLoaded().catch((error) => {
+    console.error("[MeetingTranscriber] Recovery failed on startup:", error);
   });
 });
 
@@ -117,10 +121,50 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 async function ensureMeetingsLoaded() {
-  if (activeMeetings.size > 0) {
+  if (recoveryComplete) {
     return;
   }
-  await rehydrateMeetings();
+  if (!recoveryPromise) {
+    recoveryPromise = (async () => {
+      await rehydrateMeetings();
+      await recoverStaleMeetings();
+      recoveryComplete = true;
+    })().catch((error) => {
+      recoveryPromise = null; // allow a later retry after a transient failure
+      throw error;
+    });
+  }
+  await recoveryPromise;
+}
+
+/**
+ * On a cold worker wake, any meeting persisted in a live capture status — or
+ * already flagged for finalization — is stale: the offscreen capture document
+ * died with the previous worker. Save whatever was transcribed (so a transcript
+ * is never silently lost) and clear the meeting so it can't block new captures.
+ */
+async function recoverStaleMeetings() {
+  const candidates = [...activeMeetings.values()].filter(
+    (meeting) => meeting.pendingFinalization || isCaptureLive(meeting.captureStatus)
+  );
+  if (candidates.length === 0) {
+    return;
+  }
+
+  // A live captureStatus is NOT proof the capture died: in MV3 the offscreen
+  // document and the service worker have independent lifecycles, so the worker
+  // can idle-restart while the offscreen keeps recording (and then wake cold when
+  // it delivers the next segment). Only treat a live-status meeting as stale when
+  // no offscreen document is actually running. Meetings already flagged
+  // pendingFinalization have ended, so they are always saved.
+  const offscreenAlive = await hasOpenOffscreenDocument();
+
+  for (const meeting of candidates) {
+    if (meeting.pendingFinalization || !offscreenAlive) {
+      meeting.pendingFinalization = true;
+      await finalizeMeetingIfReady(meeting.tabId);
+    }
+  }
 }
 
 async function rehydrateMeetings() {
@@ -809,20 +853,35 @@ function getMeeting(tabId) {
   return activeMeetings.get(tabId) || null;
 }
 
+// Serializes the read/modify/write of the persisted meetings map. chrome.storage
+// hands back a copy, so two concurrent get→mutate→set cycles would clobber each
+// other and silently drop a tab's latest state; this queue prevents that.
+let storageWriteChain = Promise.resolve();
+
+function withStorageLock(task) {
+  const run = storageWriteChain.then(task, task);
+  storageWriteChain = run.catch(() => {});
+  return run;
+}
+
 async function persistMeetingState(meeting) {
   activeMeetings.set(meeting.tabId, meeting);
 
-  const stored = await chrome.storage.local.get(STORAGE_KEY);
-  const meetingsByTabId = stored[STORAGE_KEY] || {};
-  meetingsByTabId[String(meeting.tabId)] = pickPersistedMeetingState(meeting);
-  await chrome.storage.local.set({ [STORAGE_KEY]: meetingsByTabId });
+  await withStorageLock(async () => {
+    const stored = await chrome.storage.local.get(STORAGE_KEY);
+    const meetingsByTabId = stored[STORAGE_KEY] || {};
+    meetingsByTabId[String(meeting.tabId)] = pickPersistedMeetingState(meeting);
+    await chrome.storage.local.set({ [STORAGE_KEY]: meetingsByTabId });
+  });
 }
 
 async function removePersistedMeeting(tabId) {
-  const stored = await chrome.storage.local.get(STORAGE_KEY);
-  const meetingsByTabId = stored[STORAGE_KEY] || {};
-  delete meetingsByTabId[String(tabId)];
-  await chrome.storage.local.set({ [STORAGE_KEY]: meetingsByTabId });
+  await withStorageLock(async () => {
+    const stored = await chrome.storage.local.get(STORAGE_KEY);
+    const meetingsByTabId = stored[STORAGE_KEY] || {};
+    delete meetingsByTabId[String(tabId)];
+    await chrome.storage.local.set({ [STORAGE_KEY]: meetingsByTabId });
+  });
 }
 
 function pickPersistedMeetingState(meeting) {
@@ -847,13 +906,16 @@ function pickPersistedMeetingState(meeting) {
   };
 }
 
-async function ensureOffscreenDocument() {
+async function hasOpenOffscreenDocument() {
   const contexts = await chrome.runtime.getContexts({
     contextTypes: ["OFFSCREEN_DOCUMENT"],
     documentUrls: [OFFSCREEN_DOCUMENT_URL],
   });
+  return contexts.length > 0;
+}
 
-  if (contexts.length > 0) {
+async function ensureOffscreenDocument() {
+  if (await hasOpenOffscreenDocument()) {
     return;
   }
 

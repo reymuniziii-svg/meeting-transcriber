@@ -12,12 +12,8 @@
 
     <key>EnvironmentVariables</key>
     <dict>
-      <key>MEETING_TRANSCRIBER_REPO_DIR</key>
-      <string>__REPO_DIR__</string>
       <key>MEETING_TRANSCRIBER_CONFIG_DIR</key>
       <string>__CONFIG_DIR__</string>
-      <key>MEETING_TRANSCRIBER_LOG_DIR</key>
-      <string>__LOG_DIR__</string>
     </dict>
 
     <key>RunAtLoad</key>

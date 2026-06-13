@@ -365,47 +365,6 @@ def diarize_with_pyannote(audio_path: str) -> list[dict]:
     return speaker_segments
 
 
-def merge_transcription_and_diarization(
-    whisper_segments: list[dict],
-    speaker_segments: list[dict],
-) -> list[dict]:
-    """Merge Whisper text with diarization labels using weighted overlap."""
-    tolerance_seconds = 0.5
-    merged = []
-
-    for whisper_segment in whisper_segments:
-        start = whisper_segment["start"] - tolerance_seconds
-        end = whisper_segment["end"] + tolerance_seconds
-        duration = whisper_segment["end"] - whisper_segment["start"]
-
-        best_speaker = "Unknown Speaker"
-        best_score = 0.0
-
-        for speaker_segment in speaker_segments:
-            overlap_start = max(start, speaker_segment["start"])
-            overlap_end = min(end, speaker_segment["end"])
-            overlap = max(0.0, overlap_end - overlap_start)
-            if overlap <= 0:
-                continue
-
-            score = overlap / max(duration, 0.1)
-            if score > best_score:
-                best_score = score
-                best_speaker = speaker_segment["speaker"]
-
-        merged.append(
-            {
-                "speaker": best_speaker,
-                "text": whisper_segment["text"],
-                "start": whisper_segment["start"],
-                "end": whisper_segment["end"],
-                "confidence": min(best_score, 1.0),
-            }
-        )
-
-    return merged
-
-
 def reset_runtime_caches() -> None:
     """Test helper for clearing cached models/pipelines."""
     global _SILERO_CACHE, _PYANNOTE_PIPELINE, _PYANNOTE_STATUS
